@@ -1,0 +1,695 @@
+#include <Servo.h>
+
+// ======================================================
+// ARDUINO MEGA - 4WD NORMAL WHEEL (SKID-STEER) CONTROLLER
+// Compatible with untouched ESP8266 Web UI & RPi lidar_navigator.py v4.0
+// ======================================================
+// Modes (from ESP8266 on Serial1, Pin 19 @ 115200):
+//   Manual      : F, B, L, R, Q, E, q, e, S
+//   Ultrasonic  : A (5x HC-SR04 autonomous)
+//   2D LiDAR    : D (RPi 4B RPLiDAR autonomous)
+//   Dual Fusion : H (RPi 4B RPLiDAR + 5x HC-SR04 ground shield)
+// ======================================================
+
+// MOTOR PINS (2x L298N Dual H-Bridge, Standard 4WD Skid-Steer)
+#define FL_IN1 22
+#define FL_IN2 24
+#define FR_IN1 26
+#define FR_IN2 28
+#define RL_IN1 30
+#define RL_IN2 32
+#define RR_IN1 34
+#define RR_IN2 36
+
+// ULTRASONIC SENSOR PINS (5x HC-SR04)
+#define TRIG_FC 38
+#define ECHO_FC 39
+#define TRIG_FL 40
+#define ECHO_FL 41
+#define TRIG_FR 42
+#define ECHO_FR 43
+#define TRIG_L  44
+#define ECHO_L  45
+#define TRIG_R  46
+#define ECHO_R  47
+
+// SERVO PINS
+#define SERVO_FL_PIN 48
+#define SERVO_FR_PIN 49
+
+Servo servoFL;
+Servo servoFR;
+
+const bool ENABLE_SERVO_SWEEP = false;
+const int SERVO_CENTER = 90;
+const int SERVO_SWEEP_MIN = 65;
+const int SERVO_SWEEP_MAX = 115;
+const int SERVO_STEP = 4;
+const unsigned long SERVO_STEP_INTERVAL = 30;
+
+int currentServoAngle = SERVO_CENTER;
+int servoDirection = 1;
+unsigned long lastServoStepTime = 0;
+
+// ======================================================
+// OPERATING MODES & STATES
+// ======================================================
+enum RoverMode {
+  MODE_MANUAL,
+  MODE_ULTRASONIC,
+  MODE_LIDAR,
+  MODE_DUAL_FUSION
+};
+
+enum AutoState {
+  AUTO_IDLE,
+  AUTO_FORWARD,
+  AUTO_BACKUP,
+  AUTO_ROTATE
+};
+
+RoverMode currentMode = MODE_MANUAL;
+AutoState autoState = AUTO_IDLE;
+int turnDirection = 1; // -1 = Left, 1 = Right
+unsigned long autoStateStartTime = 0;
+
+// ======================================================
+// SENSOR & SAFETY THRESHOLDS
+// ======================================================
+const int OBSTACLE_DIST_CM   = 30;   // Ultrasonic front avoid threshold
+const int CLEAR_DIST_CM      = 42;   // Ultrasonic front clear threshold
+const int CRITICAL_DIST_CM   = 14;   // Ultrasonic emergency backup threshold
+const int SIDE_AVOID_DIST_CM = 18;   // Ultrasonic side repulsion threshold
+const int SIDE_BLOCK_DIST_CM = 25;   // Ultrasonic side blocked threshold
+
+// Dual Fusion ground-shield thresholds
+const int DUAL_CRITICAL_CM   = 14;
+const int DUAL_FRONT_CM      = 26;
+const int DUAL_CLEAR_CM      = 36;
+const int DUAL_SIDE_CM       = 16;
+
+// Round-robin ultrasonic polling (non-blocking for 115200 baud serial)
+const unsigned long SENSOR_POLL_INTERVAL_MS = 15;
+unsigned long lastSensorPollTime = 0;
+uint8_t nextSensorIdx = 0;
+
+long distFC = 999;
+long distFL = 999;
+long distFR = 999;
+long distL  = 999;
+long distR  = 999;
+
+// Dual Fusion override state
+enum DualOverrideState {
+  DUAL_PASS_THROUGH,
+  DUAL_BACKUP,
+  DUAL_ROTATE
+};
+DualOverrideState dualState = DUAL_PASS_THROUGH;
+unsigned long dualOverrideStart = 0;
+int dualTurnDir = 1;
+char lastPiCmd = 'S';
+
+// LiDAR Watchdog & Resync
+unsigned long lastLidarCmdTime = 0;
+unsigned long lastLidarResyncTime = 0;
+const unsigned long LIDAR_TIMEOUT_MS = 1500;
+const unsigned long LIDAR_RESYNC_INTERVAL = 2500;
+
+// Manual 45-degree step rotation timer
+const unsigned long ROTATION_STEP_MS = 280;
+unsigned long stepEndTime = 0;
+bool isStepping = false;
+
+// ======================================================
+// FORWARD DECLARATIONS
+// ======================================================
+void processEspCommand();
+bool isValidEspCommand(char c);
+bool isValidPiCommand(char c);
+void executeEspCommand(char cmd);
+void executeMotorCommand(char cmd);
+void pollNextUltrasonic();
+long readDistance(int trigPin, int echoPin);
+void runUltrasonicAuto();
+void runDualFusion(char piCmd, bool hasNewPiCmd);
+void flushPiSerial();
+void sendPiMessage(const char* msg);
+void updateServoSweep();
+void centerServos();
+void stopMotors();
+void moveForward();
+void moveBackward();
+void moveLeft();
+void moveRight();
+void rotateLeft();
+void rotateRight();
+void stepRotateLeft();
+void stepRotateRight();
+void moveFrontLeft();
+void moveFrontRight();
+void moveBackLeft();
+void moveBackRight();
+
+// ======================================================
+// SETUP
+// ======================================================
+void setup() {
+  Serial.begin(115200);   // USB to Raspberry Pi (/dev/ttyACM0)
+  Serial1.begin(115200);  // ESP8266 TX -> Mega RX1 (Pin 19)
+  Serial2.begin(115200);  // Optional RPi GPIO UART (RX2=17, TX2=16)
+
+  pinMode(FL_IN1, OUTPUT); pinMode(FL_IN2, OUTPUT);
+  pinMode(FR_IN1, OUTPUT); pinMode(FR_IN2, OUTPUT);
+  pinMode(RL_IN1, OUTPUT); pinMode(RL_IN2, OUTPUT);
+  pinMode(RR_IN1, OUTPUT); pinMode(RR_IN2, OUTPUT);
+
+  pinMode(TRIG_FC, OUTPUT); pinMode(ECHO_FC, INPUT);
+  pinMode(TRIG_FL, OUTPUT); pinMode(ECHO_FL, INPUT);
+  pinMode(TRIG_FR, OUTPUT); pinMode(ECHO_FR, INPUT);
+  pinMode(TRIG_L,  OUTPUT); pinMode(ECHO_L,  INPUT);
+  pinMode(TRIG_R,  OUTPUT); pinMode(ECHO_R,  INPUT);
+
+  digitalWrite(TRIG_FC, LOW);
+  digitalWrite(TRIG_FL, LOW);
+  digitalWrite(TRIG_FR, LOW);
+  digitalWrite(TRIG_L,  LOW);
+  digitalWrite(TRIG_R,  LOW);
+
+  servoFL.attach(SERVO_FL_PIN);
+  servoFR.attach(SERVO_FR_PIN);
+  centerServos();
+  stopMotors();
+
+  delay(100);
+  while (Serial1.available() > 0) Serial1.read();
+  flushPiSerial();
+
+  Serial.println("================================================");
+  Serial.println(" Arduino Mega 4WD Skid-Steer Controller Ready");
+  Serial.println(" Modes: MANUAL | ULTRASONIC | LIDAR | DUAL");
+  Serial.println("================================================");
+}
+
+// ======================================================
+// MAIN LOOP
+// ======================================================
+void loop() {
+  unsigned long now = millis();
+
+  // 1. Always prioritize ESP8266 Web UI commands (with noise/reboot filter)
+  if (Serial1.available() > 0) {
+    processEspCommand();
+  }
+
+  // 2. Poll ultrasonic sensors round-robin in Ultrasonic or Dual Fusion mode
+  if (currentMode == MODE_ULTRASONIC || currentMode == MODE_DUAL_FUSION) {
+    if (now - lastSensorPollTime >= SENSOR_POLL_INTERVAL_MS) {
+      lastSensorPollTime = now;
+      pollNextUltrasonic();
+    }
+  }
+
+  // 3. Mode-specific execution
+  switch (currentMode) {
+    case MODE_MANUAL:
+      flushPiSerial();
+      if (isStepping && now >= stepEndTime) {
+        stopMotors();
+        isStepping = false;
+      }
+      break;
+
+    case MODE_ULTRASONIC:
+      flushPiSerial();
+      runUltrasonicAuto();
+      break;
+
+    case MODE_LIDAR:
+    case MODE_DUAL_FUSION: {
+      char latestPiCmd = 0;
+      while (Serial2.available() > 0) {
+        char c = Serial2.read();
+        if (isValidPiCommand(c)) latestPiCmd = c;
+      }
+      while (Serial.available() > 0) {
+        char c = Serial.read();
+        if (isValidPiCommand(c)) latestPiCmd = c;
+      }
+
+      bool hasNewPiCmd = (latestPiCmd != 0);
+      if (hasNewPiCmd) {
+        lastLidarCmdTime = now;
+        lastPiCmd = latestPiCmd;
+      }
+
+      // Watchdog: pause motors if Pi stops sending, and resync LIDAR:START
+      if (now - lastLidarCmdTime > LIDAR_TIMEOUT_MS) {
+        stopMotors();
+        if (now - lastLidarResyncTime > LIDAR_RESYNC_INTERVAL) {
+          lastLidarResyncTime = now;
+          sendPiMessage("LIDAR:START");
+        }
+        break;
+      }
+
+      if (currentMode == MODE_LIDAR) {
+        if (hasNewPiCmd) {
+          executeMotorCommand(latestPiCmd);
+        }
+      } else {
+        runDualFusion(lastPiCmd, hasNewPiCmd);
+      }
+      break;
+    }
+  }
+}
+
+// ======================================================
+// ESP8266 COMMAND PARSER WITH BOOT-BANNER / EMI FILTER
+// ======================================================
+bool isValidEspCommand(char c) {
+  switch (c) {
+    case 'F': case 'B': case 'L': case 'R':
+    case 'Q': case 'E': case 'q': case 'e':
+    case 'S': case 'A': case 'D': case 'H':
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isValidPiCommand(char c) {
+  switch (c) {
+    case 'F': case 'B': case 'L': case 'R':
+    case 'Q': case 'E': case 'I': case 'O':
+    case 'J': case 'K': case 'S':
+      return true;
+    default:
+      return false;
+  }
+}
+
+void processEspCommand() {
+  delay(2);
+
+  if (Serial1.available() > 2) {
+    bool isBannerOrNoise = false;
+    char lastValid = 0;
+    while (Serial1.available() > 0) {
+      char c = Serial1.read();
+      if (!isValidEspCommand(c)) {
+        isBannerOrNoise = true;
+      } else {
+        lastValid = c;
+      }
+    }
+    if (isBannerOrNoise) {
+      unsigned long drainStart = millis();
+      while (millis() - drainStart < 120) {
+        while (Serial1.available() > 0) Serial1.read();
+      }
+      return;
+    }
+    if (lastValid != 0) {
+      executeEspCommand(lastValid);
+    }
+    return;
+  }
+
+  while (Serial1.available() > 0) {
+    char cmd = Serial1.read();
+    if (isValidEspCommand(cmd)) {
+      executeEspCommand(cmd);
+    }
+  }
+}
+
+void executeEspCommand(char cmd) {
+  isStepping = false;
+
+  if (cmd == 'A') {
+    currentMode = MODE_ULTRASONIC;
+    autoState = AUTO_IDLE;
+    centerServos();
+    stopMotors();
+    sendPiMessage("LIDAR:STOP");
+    flushPiSerial();
+    return;
+  }
+
+  if (cmd == 'D') {
+    currentMode = MODE_LIDAR;
+    lastLidarCmdTime = millis();
+    lastLidarResyncTime = millis();
+    lastPiCmd = 'S';
+    centerServos();
+    stopMotors();
+    flushPiSerial();
+    sendPiMessage("LIDAR:START");
+    return;
+  }
+
+  if (cmd == 'H') {
+    currentMode = MODE_DUAL_FUSION;
+    dualState = DUAL_PASS_THROUGH;
+    lastLidarCmdTime = millis();
+    lastLidarResyncTime = millis();
+    lastPiCmd = 'S';
+    distFC = distFL = distFR = distL = distR = 999;
+    centerServos();
+    stopMotors();
+    flushPiSerial();
+    sendPiMessage("LIDAR:START");
+    return;
+  }
+
+  if (currentMode != MODE_MANUAL) {
+    if (currentMode == MODE_LIDAR || currentMode == MODE_DUAL_FUSION) {
+      sendPiMessage("LIDAR:STOP");
+    }
+    currentMode = MODE_MANUAL;
+    autoState = AUTO_IDLE;
+    dualState = DUAL_PASS_THROUGH;
+    centerServos();
+    stopMotors();
+    flushPiSerial();
+  }
+
+  executeMotorCommand(cmd);
+}
+
+// ======================================================
+// SERIAL HELPERS (Pi Handshake)
+// ======================================================
+void sendPiMessage(const char* msg) {
+  Serial.println(msg);
+  Serial2.println(msg);
+}
+
+void flushPiSerial() {
+  while (Serial.available() > 0) Serial.read();
+  while (Serial2.available() > 0) Serial2.read();
+}
+
+// ======================================================
+// DUAL FUSION MODE (RPi 2D LiDAR + 5x Ultrasonic Ground Shield)
+// ======================================================
+void runDualFusion(char piCmd, bool hasNewPiCmd) {
+  unsigned long now = millis();
+  long frontMin = min(distFC, min(distFL, distFR));
+
+  switch (dualState) {
+    case DUAL_PASS_THROUGH:
+      if (frontMin < DUAL_CRITICAL_CM) {
+        stopMotors();
+        moveBackward();
+        dualState = DUAL_BACKUP;
+        dualOverrideStart = now;
+        return;
+      }
+
+      if (frontMin < DUAL_FRONT_CM && (piCmd == 'F' || piCmd == 'I' || piCmd == 'O')) {
+        stopMotors();
+        if (distL < SIDE_BLOCK_DIST_CM && distR >= SIDE_BLOCK_DIST_CM) {
+          dualTurnDir = 1;
+        } else if (distR < SIDE_BLOCK_DIST_CM && distL >= SIDE_BLOCK_DIST_CM) {
+          dualTurnDir = -1;
+        } else {
+          dualTurnDir = (distL > distR) ? -1 : 1;
+        }
+        if (dualTurnDir < 0) rotateLeft();
+        else rotateRight();
+        dualState = DUAL_ROTATE;
+        dualOverrideStart = now;
+        return;
+      }
+
+      if (piCmd == 'F') {
+        if (distL < DUAL_SIDE_CM && distR >= DUAL_SIDE_CM) {
+          moveFrontRight();
+          return;
+        } else if (distR < DUAL_SIDE_CM && distL >= DUAL_SIDE_CM) {
+          moveFrontLeft();
+          return;
+        }
+      }
+
+      if (hasNewPiCmd) {
+        executeMotorCommand(piCmd);
+      }
+      break;
+
+    case DUAL_BACKUP:
+      if (now - dualOverrideStart >= 320) {
+        stopMotors();
+        dualTurnDir = (distL > distR) ? -1 : 1;
+        if (dualTurnDir < 0) rotateLeft();
+        else rotateRight();
+        dualState = DUAL_ROTATE;
+        dualOverrideStart = now;
+      }
+      break;
+
+    case DUAL_ROTATE:
+      if (distFC > DUAL_CLEAR_CM && distFL > DUAL_CLEAR_CM && distFR > DUAL_CLEAR_CM) {
+        dualState = DUAL_PASS_THROUGH;
+        executeMotorCommand(piCmd);
+      } else if (now - dualOverrideStart > 3000) {
+        moveBackward();
+        dualState = DUAL_BACKUP;
+        dualOverrideStart = now;
+      }
+      break;
+  }
+}
+
+// ======================================================
+// ULTRASONIC AUTONOMOUS MODE (5x HC-SR04)
+// ======================================================
+void runUltrasonicAuto() {
+  unsigned long now = millis();
+
+  switch (autoState) {
+    case AUTO_IDLE:
+      moveForward();
+      autoState = AUTO_FORWARD;
+      autoStateStartTime = now;
+      break;
+
+    case AUTO_FORWARD:
+      updateServoSweep();
+
+      if (distFC < CRITICAL_DIST_CM || distFL < CRITICAL_DIST_CM || distFR < CRITICAL_DIST_CM) {
+        stopMotors();
+        centerServos();
+        moveBackward();
+        autoState = AUTO_BACKUP;
+        autoStateStartTime = now;
+        return;
+      }
+
+      if (distFC < OBSTACLE_DIST_CM || distFL < OBSTACLE_DIST_CM || distFR < OBSTACLE_DIST_CM) {
+        stopMotors();
+        centerServos();
+
+        bool rightBlocked = (distR < SIDE_BLOCK_DIST_CM);
+        bool leftBlocked  = (distL < SIDE_BLOCK_DIST_CM);
+
+        if (rightBlocked && !leftBlocked) {
+          turnDirection = -1;
+        } else if (leftBlocked && !rightBlocked) {
+          turnDirection = 1;
+        } else if (rightBlocked && leftBlocked) {
+          moveBackward();
+          autoState = AUTO_BACKUP;
+          autoStateStartTime = now;
+          return;
+        } else {
+          if (abs(distL - distR) > 8) {
+            turnDirection = (distL > distR) ? -1 : 1;
+          } else if (distFL < distFR - 3) {
+            turnDirection = 1;
+          } else if (distFR < distFL - 3) {
+            turnDirection = -1;
+          } else {
+            turnDirection = (distL >= distR) ? -1 : 1;
+          }
+        }
+
+        autoState = AUTO_ROTATE;
+        autoStateStartTime = now;
+        if (turnDirection < 0) rotateLeft();
+        else rotateRight();
+        return;
+      }
+
+      // Side wall repulsion using normal 4WD skid-steer curves
+      if (distL < SIDE_AVOID_DIST_CM && distR >= SIDE_AVOID_DIST_CM) {
+        moveFrontRight();
+      } else if (distR < SIDE_AVOID_DIST_CM && distL >= SIDE_AVOID_DIST_CM) {
+        moveFrontLeft();
+      } else {
+        moveForward();
+      }
+      break;
+
+    case AUTO_BACKUP:
+      centerServos();
+      if (now - autoStateStartTime >= 350) {
+        stopMotors();
+        turnDirection = (distL > distR) ? -1 : 1;
+        if (turnDirection < 0) rotateLeft();
+        else rotateRight();
+        autoState = AUTO_ROTATE;
+        autoStateStartTime = now;
+      }
+      break;
+
+    case AUTO_ROTATE:
+      centerServos();
+      if (distFC > CLEAR_DIST_CM && distFL > CLEAR_DIST_CM && distFR > CLEAR_DIST_CM) {
+        stopMotors();
+        delay(30);
+        moveForward();
+        autoState = AUTO_FORWARD;
+        autoStateStartTime = now;
+        return;
+      }
+      if (now - autoStateStartTime > 4000) {
+        stopMotors();
+        moveBackward();
+        autoState = AUTO_BACKUP;
+        autoStateStartTime = now;
+      }
+      break;
+  }
+}
+
+// ======================================================
+// NON-BLOCKING ROUND-ROBIN ULTRASONIC POLLING
+// ======================================================
+void pollNextUltrasonic() {
+  switch (nextSensorIdx) {
+    case 0: distFC = readDistance(TRIG_FC, ECHO_FC); break;
+    case 1: distFL = readDistance(TRIG_FL, ECHO_FL); break;
+    case 2: distFR = readDistance(TRIG_FR, ECHO_FR); break;
+    case 3: distL  = readDistance(TRIG_L,  ECHO_L);  break;
+    case 4: distR  = readDistance(TRIG_R,  ECHO_R);  break;
+  }
+  nextSensorIdx = (nextSensorIdx + 1) % 5;
+}
+
+long readDistance(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 12000);
+  if (duration == 0) return 999;
+  long cm = (duration * 343L) / 20000L;
+  return (cm <= 0) ? 999 : cm;
+}
+
+// ======================================================
+// MOTOR COMMAND DISPATCHER & 4WD SKID-STEER KINEMATICS
+// ======================================================
+void executeMotorCommand(char cmd) {
+  switch (cmd) {
+    case 'F': moveForward(); break;
+    case 'B': moveBackward(); break;
+    case 'L': moveLeft(); break;
+    case 'R': moveRight(); break;
+    case 'Q': rotateLeft(); break;
+    case 'E': rotateRight(); break;
+    case 'q': stepRotateLeft(); break;
+    case 'e': stepRotateRight(); break;
+    case 'I': moveFrontLeft(); break;
+    case 'O': moveFrontRight(); break;
+    case 'J': moveBackLeft(); break;
+    case 'K': moveBackRight(); break;
+    case 'S': stopMotors(); break;
+    default:  stopMotors(); break;
+  }
+}
+
+void motorFL(int dir) {
+  digitalWrite(FL_IN1, dir > 0 ? HIGH : LOW);
+  digitalWrite(FL_IN2, dir < 0 ? HIGH : LOW);
+}
+
+void motorFR(int dir) {
+  digitalWrite(FR_IN1, dir > 0 ? HIGH : LOW);
+  digitalWrite(FR_IN2, dir < 0 ? HIGH : LOW);
+}
+
+void motorRL(int dir) {
+  digitalWrite(RL_IN1, dir > 0 ? HIGH : LOW);
+  digitalWrite(RL_IN2, dir < 0 ? HIGH : LOW);
+}
+
+void motorRR(int dir) {
+  digitalWrite(RR_IN1, dir > 0 ? HIGH : LOW);
+  digitalWrite(RR_IN2, dir < 0 ? HIGH : LOW);
+}
+
+void stopMotors() {
+  isStepping = false;
+  motorFL(0); motorFR(0); motorRL(0); motorRR(0);
+}
+
+void moveForward()  { motorFL(1);  motorFR(1);  motorRL(1);  motorRR(1);  }
+void moveBackward() { motorFL(-1); motorFR(-1); motorRL(-1); motorRR(-1); }
+
+// 4WD Skid-Steer In-Place Tank Turns
+void rotateLeft()   { motorFL(-1); motorFR(1);  motorRL(-1); motorRR(1);  }
+void rotateRight()  { motorFL(1);  motorFR(-1); motorRL(1);  motorRR(-1); }
+void moveLeft()     { rotateLeft();  }
+void moveRight()    { rotateRight(); }
+
+void stepRotateLeft() {
+  rotateLeft();
+  isStepping = true;
+  stepEndTime = millis() + ROTATION_STEP_MS;
+}
+
+void stepRotateRight() {
+  rotateRight();
+  isStepping = true;
+  stepEndTime = millis() + ROTATION_STEP_MS;
+}
+
+// 4WD Skid-Steer Smooth Curves (Normal Wheels)
+void moveFrontLeft()  { motorFL(0);  motorFR(1);  motorRL(0);  motorRR(1);  } // Right bank drives -> curves Left
+void moveFrontRight() { motorFL(1);  motorFR(0);  motorRL(1);  motorRR(0);  } // Left bank drives  -> curves Right
+void moveBackLeft()   { motorFL(0);  motorFR(-1); motorRL(0);  motorRR(-1); } // Right bank reverses -> curves Back-Left
+void moveBackRight()  { motorFL(-1); motorFR(0);  motorRL(-1); motorRR(0);  } // Left bank reverses  -> curves Back-Right
+
+// ======================================================
+// SERVO HELPERS
+// ======================================================
+void centerServos() {
+  currentServoAngle = SERVO_CENTER;
+  servoFL.write(SERVO_CENTER);
+  servoFR.write(SERVO_CENTER);
+}
+
+void updateServoSweep() {
+  if (!ENABLE_SERVO_SWEEP) return;
+  unsigned long now = millis();
+  if (now - lastServoStepTime >= SERVO_STEP_INTERVAL) {
+    lastServoStepTime = now;
+    currentServoAngle += servoDirection * SERVO_STEP;
+    if (currentServoAngle >= SERVO_SWEEP_MAX) {
+      currentServoAngle = SERVO_SWEEP_MAX;
+      servoDirection = -1;
+    } else if (currentServoAngle <= SERVO_SWEEP_MIN) {
+      currentServoAngle = SERVO_SWEEP_MIN;
+      servoDirection = 1;
+    }
+    servoFL.write(currentServoAngle);
+    servoFR.write(currentServoAngle);
+  }
+}
