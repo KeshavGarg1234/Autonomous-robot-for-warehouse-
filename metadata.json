@@ -1,0 +1,6 @@
+{
+  "name": "Warehouse Robot Coordination Arena",
+  "description": "Multi-robot fleet coordination simulator with Space-Time A*, spline path smoothing, dynamic obstacle replanning, deadlock resolution, and transactional package recovery.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
