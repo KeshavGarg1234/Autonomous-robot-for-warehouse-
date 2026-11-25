@@ -1,0 +1,1530 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+
+// ======================================================
+// ESP8266 - WIFI & WEB SERVER (4WD AUTONOMOUS ROVER)
+// Version 4.5: Multi-Touch + Live Sensor Diagnostics + 2D Radar
+// ======================================================
+// Hardware Wiring:
+// 1. ESP8266 TX  -> Arduino Mega RX1 (Pin 19)
+// 2. Arduino Mega TX1 (Pin 18) -> 10k/20k Voltage Divider -> ESP8266 RX (GPIO 3)
+//    - 10k resistor from Mega Pin 18 to ESP RX
+//    - 20k resistor from ESP RX to GND (safely steps 5V down to 3.3V)
+// 3. ESP8266 GND -> Arduino Mega GND (Common Ground)
+// ======================================================
+
+ESP8266WebServer server(80);
+
+// Live Telemetry Cache received from Mega over Serial
+int telemFC = 999;
+int telemFL = 999;
+int telemFR = 999;
+int telemL  = 999;
+int telemR  = 999;
+int telemUSCount = 5;
+int telemRpiOk = 0;
+int telemLidarOk = 0;
+int telemMode = 0;
+unsigned long lastMegaTelemTime = 0;
+String megaSerialBuf = "";
+
+// 36-ray LiDAR distance cache (streamed from RPi -> Mega -> ESP8266 via wire)
+int lidarRays[36];
+unsigned long lastLidarRaysTime = 0;
+
+// ======================================================
+// FLEET ROVER PROXIMITY AVOIDANCE CONFIGURATION
+// ======================================================
+const char* TARGET_ROVER_BEACON = "ROVER_SIM_02";
+bool fleetTrackingEnabled   = true;  // Remote Enable/Disable toggle (Fleet Tracking)
+int  rssiStopThreshold      = -48;   // User-adjustable Stop Threshold (Default -48 dBm = ~1.2m close)
+int  rssiResumeThreshold    = -56;   // Hysteresis release (-48 - 8 = -56 dBm)
+const unsigned long BEACON_TIMEOUT_MS = 1000; // Fast clear if beacon vanishes
+
+bool roverProximityAlert = false;
+int  lastRoverRssi = -999;
+int  proximityConsecutiveHits = 0;   // Debounce: requires 2 consecutive hits
+unsigned long lastBeaconSeenTime = 0;
+unsigned long lastScanStartTime = 0;
+bool isScanning = false;
+int  telemMegaProxHold = 0;          // Feedback from Mega: 1 if Mega is currently in safety hold
+
+// ======================================================
+// WEB PAGE (Manual, Ultrasonic Auto, LiDAR Auto, Dual Fusion, Sensor Test)
+// ======================================================
+const char MAIN_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>4WD Rover Controller & Diagnostics</title>
+<style>
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+body { margin: 0; background: #0c0e12; color: #f0f4f8; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; display: flex; justify-content: center; min-height: 100vh; overflow-x: hidden; }
+.container { width: 100%; max-width: 480px; padding: 16px; }
+h1 { text-align: center; margin: 4px 0 2px; font-size: 22px; letter-spacing: 1.5px; color: #fff; font-weight: 800; text-transform: uppercase; }
+.subtitle { text-align: center; color: #64748b; font-size: 12px; margin-bottom: 14px; letter-spacing: 0.5px; }
+
+/* Mode Bar */
+.modeBar { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+.modeButton { border: 1px solid #1e293b; background: #151b23; color: #94a3b8; border-radius: 12px; padding: 11px 6px; font-size: 12px; font-weight: 700; cursor: pointer; transition: all 0.2s ease; letter-spacing: 0.5px; }
+.modeButton:hover { border-color: #334155; color: #f1f5f9; }
+.modeButton.active { background: #38bdf8; color: #041019; border-color: #38bdf8; box-shadow: 0 0 14px rgba(56,189,248,0.4); }
+.modeButton.autoBtn.active { background: #10b981; color: #022013; border-color: #10b981; box-shadow: 0 0 14px rgba(16,185,129,0.4); }
+.modeButton.lidarBtn.active { background: #8b5cf6; color: #150529; border-color: #8b5cf6; box-shadow: 0 0 14px rgba(139,92,246,0.45); }
+.modeButton.dualBtn.active { background: #f59e0b; color: #1c1002; border-color: #f59e0b; box-shadow: 0 0 14px rgba(245,158,11,0.45); }
+.modeButton.testBtn { grid-column: span 2; }
+.modeButton.testBtn.active { background: #06b6d4; color: #042129; border-color: #06b6d4; box-shadow: 0 0 14px rgba(6,182,212,0.45); }
+
+.status { background: #111620; border: 1px solid #1e293b; border-radius: 12px; padding: 10px 14px; margin-bottom: 14px; text-align: center; font-size: 13px; color: #94a3b8; }
+.status strong { color: #f8fafc; font-weight: 700; letter-spacing: 0.5px; }
+.lockStatus { margin-top: 4px; font-size: 11px; color: #fbbf24; min-height: 14px; }
+
+/* Control Panels */
+.controls { display: none; flex-direction: column; align-items: center; gap: 10px; width: 100%; }
+.controls.show { display: flex; }
+.row { display: flex; justify-content: center; gap: 10px; width: 100%; }
+.btn { width: 110px; height: 72px; border: none; border-radius: 14px; background: #1a2230; color: #f8fafc; font-size: 13px; font-weight: 700; user-select: none; -webkit-user-select: none; touch-action: none; box-shadow: 0 4px 0 #090d14, inset 0 0 0 1px #2a374d; transition: transform 0.05s, background 0.1s; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; }
+.btn span.icon { font-size: 18px; line-height: 1; }
+.btn:active, .btn.pressed { transform: translateY(3px); box-shadow: 0 1px 0 #090d14, inset 0 0 0 1px #475569; background: #2e3c54; }
+.btn.locked { background: #785108; box-shadow: 0 0 0 2px #fbbf24, 0 4px 0 #090d14; color: #fff; }
+.btn.stop { background: #dc2626; box-shadow: 0 4px 0 #7f1d1d, inset 0 0 0 1px #ef4444; color: white; }
+.btn.stop:active { background: #b91c1c; }
+
+/* Cards */
+.card { width: 100%; border-radius: 16px; padding: 18px 14px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 12px; }
+.autoCard { background: #0b1c13; border: 1px solid #144626; }
+.lidarCard { background: #130e24; border: 1px solid #3b226e; }
+.dualCard { background: #1c1507; border: 1px solid #78480a; }
+.testCard { background: #081a20; border: 1px solid #0e4450; width: 100%; }
+
+.radarAnim { width: 84px; height: 84px; border-radius: 50%; border: 2px solid #10b981; position: relative; overflow: hidden; background: radial-gradient(circle, #052e16 20%, #03140a 80%); box-shadow: 0 0 18px rgba(16,185,129,0.25); }
+.radarCircle { position: absolute; inset: 15px; border-radius: 50%; border: 1px dashed rgba(16, 185, 129, 0.4); }
+.radarScanner { position: absolute; width: 50%; height: 50%; top: 0; right: 0; background: linear-gradient(45deg, rgba(16,185,129,0.6), transparent); transform-origin: 0% 100%; animation: radarSweep 2s linear infinite; }
+.roverDot { position: absolute; width: 10px; height: 10px; background: #fff; border-radius: 50%; top: calc(50% - 5px); left: calc(50% - 5px); box-shadow: 0 0 8px #10b981; }
+@keyframes radarSweep { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+/* ====================================================== */
+/* DIAGNOSTICS & TEST MODE STYLES */
+/* ====================================================== */
+.diagBadgeGrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; width: 100%; }
+.diagBadge { background: #111620; border: 1px solid #1e293b; border-radius: 8px; padding: 6px 4px; font-size: 10px; text-align: center; }
+.diagBadge .val { font-size: 13px; font-weight: 800; margin-top: 2px; }
+.val.ok { color: #10b981; }
+.val.wait { color: #f59e0b; }
+.val.err { color: #ef4444; }
+
+/* Subtabs in Test Mode */
+.testTabs { display: flex; gap: 4px; width: 100%; overflow-x: auto; padding-bottom: 4px; }
+.testTabBtn { flex: 1; min-width: 65px; background: #132228; border: 1px solid #1e3a42; border-radius: 8px; padding: 8px 4px; font-size: 11px; font-weight: 700; color: #94a3b8; cursor: pointer; text-align: center; }
+.testTabBtn.active { background: #06b6d4; color: #042129; border-color: #06b6d4; }
+
+/* Ultrasonic Visualizer */
+.ultraBox { width: 100%; background: #0b1519; border: 1px solid #142f38; border-radius: 12px; padding: 14px; display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.ultraReadout { font-size: 38px; font-weight: 900; color: #06b6d4; font-variant-numeric: tabular-nums; }
+.ultraUnit { font-size: 14px; font-weight: 600; color: #64748b; }
+.ultraBarBox { width: 100%; max-width: 320px; height: 16px; background: #1e293b; border-radius: 8px; overflow: hidden; position: relative; }
+.ultraBarFill { height: 100%; width: 50%; background: #06b6d4; transition: width 0.1s ease, background 0.2s; }
+.ultraConesGrid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; width: 100%; max-width: 380px; margin-top: 6px; }
+.coneItem { background: #112028; border: 1px solid #1c3540; border-radius: 8px; padding: 6px 2px; text-align: center; font-size: 10px; cursor: pointer; }
+.coneItem.sel { border-color: #06b6d4; background: #163642; }
+.coneItem .dir { color: #64748b; font-weight: 700; }
+.coneItem .dist { font-size: 13px; font-weight: 800; color: #f0f4f8; margin-top: 2px; }
+
+/* 2D LiDAR Radar Canvas */
+.lidarRadarBox { position: relative; width: 330px; height: 330px; max-width: 86vw; max-height: 86vw; background: #05070a; border: 2px solid #1e3a42; border-radius: 50%; overflow: hidden; box-shadow: 0 0 24px rgba(6,182,212,0.18); margin: 6px 0; }
+#lidarCanvas { width: 100%; height: 100%; display: block; }
+.radarLegend { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; width: 100%; max-width: 380px; }
+.sectorPill { background: #0d171d; border: 1px solid #19333f; border-radius: 6px; padding: 4px 2px; font-size: 10px; text-align: center; }
+.sectorPill .n { color: #64748b; font-weight: 700; }
+.sectorPill .d { font-weight: 800; color: #10b981; }
+
+/* Fleet Proximity Card & Settings */
+.fleetCard { width: 100%; background: #111722; border: 1px solid #1e293b; border-radius: 14px; padding: 10px 12px; margin-bottom: 12px; }
+.fleetHeader { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.fleetTitle { display: flex; align-items: center; gap: 8px; }
+.fleetToggle { border: none; border-radius: 8px; padding: 6px 12px; font-size: 11px; font-weight: 800; cursor: pointer; transition: all 0.2s ease; }
+.fleetToggle.on { background: #10b981; color: #022013; box-shadow: 0 0 10px rgba(16,185,129,0.35); }
+.fleetToggle.off { background: #334155; color: #94a3b8; }
+.fleetGearBtn { background: #1e293b; border: 1px solid #334155; color: #94a3b8; border-radius: 8px; padding: 6px 9px; font-size: 11px; font-weight: 700; cursor: pointer; }
+.fleetGearBtn:hover { color: #f1f5f9; border-color: #64748b; }
+.fleetSettingsBox { margin-top: 10px; padding-top: 10px; border-top: 1px solid #1e293b; }
+.fleetSignalRow { display: flex; justify-content: space-between; align-items: center; background: #0b1017; border-radius: 8px; padding: 6px 8px; border: 1px solid #1a2434; }
+.fleetPresetGrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin: 8px 0; }
+.presetBtn { background: #151d28; border: 1px solid #233144; color: #94a3b8; border-radius: 6px; padding: 6px 2px; font-size: 10px; font-weight: 700; cursor: pointer; text-align: center; }
+.presetBtn.active { background: #06b6d4; color: #042129; border-color: #06b6d4; font-weight: 800; }
+.calibrateBtn { width: 100%; background: #1e1b4b; border: 1px solid #4338ca; color: #a5b4fc; border-radius: 8px; padding: 8px; font-size: 11px; font-weight: 800; cursor: pointer; margin-top: 4px; }
+.calibrateBtn:hover { background: #312e81; color: #fff; }
+
+.instructions { margin-top: 16px; padding: 12px; background: #111620; border: 1px solid #1e293b; border-radius: 12px; color: #64748b; font-size: 11px; line-height: 1.5; text-align: center; }
+@media (max-width: 380px) { .container { padding: 10px; } .btn { width: 92px; height: 64px; font-size: 12px; } }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>4WD ROVER</h1>
+  <div class="subtitle">Multi-Touch Drive & Live Diagnostics</div>
+
+  <!-- ROVER-TO-ROVER PROXIMITY ALERT BANNER -->
+  <div id="proxAlertBox" style="display:none; background:#7f1d1d; border:2px solid #ef4444; border-radius:12px; padding:10px 14px; margin-bottom:12px; text-align:center; color:#fff; box-shadow:0 0 16px rgba(239,68,68,0.45);">
+    <div style="font-size:13px; font-weight:800; letter-spacing:0.5px;">⚠️ ROVER PROXIMITY DETECTED!</div>
+    <div style="font-size:11px; margin-top:2px; color:#fca5a5;">Another rover in close range. Main rover HALTED.</div>
+    <div style="font-size:11px; font-weight:700; color:#fbbf24; margin-top:3px;">Signal: <span id="proxRssiVal">--</span> dBm (Threshold: <span id="proxThreshDisp">-48</span> dBm)</div>
+  </div>
+
+  <!-- FLEET ROVER AVOIDANCE CONTROLLER & RANGE CALIBRATION -->
+  <div class="fleetCard">
+    <div class="fleetHeader">
+      <div class="fleetTitle">
+        <span style="font-size:18px;">🛰️</span>
+        <div>
+          <div style="font-weight:800; font-size:12px; color:#f1f5f9; letter-spacing:0.5px;">FLEET AVOIDANCE</div>
+          <div id="fleetSub" style="font-size:10px; color:#10b981; font-weight:700;">ACTIVE (CLOSE-RANGE SAFETY STOP)</div>
+        </div>
+      </div>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <button id="fleetToggleBtn" class="fleetToggle on" onclick="toggleFleetAvoidance()">ON</button>
+        <button id="fleetSettingsBtn" class="fleetGearBtn" onclick="toggleFleetSettings()">⚙️ RANGE</button>
+      </div>
+    </div>
+
+    <!-- Collapsible Range Calibration Settings -->
+    <div id="fleetSettingsPanel" style="display:none;" class="fleetSettingsBox">
+      <div class="fleetSignalRow">
+        <div style="font-size:11px; color:#94a3b8; font-weight:700;">Rover #2 Live Signal:</div>
+        <div id="fleetLiveRssi" style="font-size:12px; font-weight:800; color:#38bdf8;">-- dBm (WAIT)</div>
+      </div>
+
+      <div style="margin:8px 0 4px;">
+        <div style="display:flex; justify-content:space-between; font-size:11px; font-weight:700; color:#cbd5e1;">
+          <span>Stop Distance Threshold:</span>
+          <span id="threshLabel" style="color:#f59e0b; font-weight:800;">-48 dBm (CLOSE)</span>
+        </div>
+        <input type="range" id="proxSlider" min="-65" max="-38" step="1" value="-48" oninput="onSliderChange(this.value)" style="width:100%; margin:6px 0; accent-color:#06b6d4;">
+        <div style="display:flex; justify-content:space-between; font-size:9px; color:#64748b; font-weight:700;">
+          <span>FAR (-65dBm)</span>
+          <span>MED (-55dBm)</span>
+          <span>CLOSE (-48dBm)</span>
+          <span>NEAR (-38dBm)</span>
+        </div>
+      </div>
+
+      <div class="fleetPresetGrid">
+        <button class="presetBtn" id="pre_vclose" onclick="setRangePreset(-40, 'VERY NEAR (~0.7m)')">NEAR</button>
+        <button class="presetBtn active" id="pre_close" onclick="setRangePreset(-48, 'CLOSE (~1.2m)')">CLOSE</button>
+        <button class="presetBtn" id="pre_med" onclick="setRangePreset(-55, 'MEDIUM (~1.8m)')">MED</button>
+        <button class="presetBtn" id="pre_far" onclick="setRangePreset(-62, 'FAR (~2.5m)')">FAR</button>
+      </div>
+
+      <button class="calibrateBtn" onclick="calibrateAtCurrentDistance()">
+        🎯 SET CURRENT DISTANCE AS STOP THRESHOLD
+      </button>
+    </div>
+  </div>
+
+  <div class="modeBar">
+    <button id="basicMode" class="modeButton active" onclick="setMode('basic')">MANUAL</button>
+    <button id="autoMode" class="modeButton autoBtn" onclick="setMode('auto')">⚡ ULTRASONIC</button>
+    <button id="lidarMode" class="modeButton lidarBtn" onclick="setMode('lidar')">🎯 2D LIDAR</button>
+    <button id="dualMode" class="modeButton dualBtn" onclick="setMode('dual')">🛡️ DUAL FUSION</button>
+    <button id="testMode" class="modeButton testBtn" onclick="setMode('test')">🔬 SENSOR TEST & RADAR</button>
+  </div>
+
+  <div class="status">
+    MODE: <strong id="modeText">MANUAL (DRIVE PRIORITY)</strong>
+    <div class="lockStatus" id="lockText">No movement locked</div>
+  </div>
+
+  <!-- 1. BASIC MANUAL CONTROLS -->
+  <div id="basicControls" class="controls show">
+    <div class="row">
+      <button class="btn" data-command="forward"><span class="icon">▲</span>FORWARD</button>
+    </div>
+    <div class="row">
+      <button class="btn" data-command="rotateLeft"><span class="icon">⟲</span>TURN LEFT</button>
+      <button class="btn stop" onclick="stopAll()"><span class="icon">■</span>STOP</button>
+      <button class="btn" data-command="rotateRight"><span class="icon">⟳</span>TURN RIGHT</button>
+    </div>
+    <div class="row">
+      <button class="btn" data-command="backward"><span class="icon">▼</span>REVERSE</button>
+    </div>
+  </div>
+
+  <!-- 2. ULTRASONIC AUTO CONTROLS -->
+  <div id="autoControls" class="controls">
+    <div class="card autoCard">
+      <div class="radarAnim">
+        <div class="radarCircle"></div>
+        <div class="radarScanner"></div>
+        <div class="roverDot"></div>
+      </div>
+      <div style="font-size: 14px; font-weight: 800; color: #10b981;">ULTRASONIC AUTO ACTIVE (5 SENSORS)</div>
+      <div style="font-size: 12px; color: #94a3b8; line-height: 1.4;">
+        Dynamic avoidance using 5 HC-SR04 sensors. Automatically ignores any disconnected sensor without freezing.
+      </div>
+      <button class="btn stop" style="width: 100%; max-width: 280px; height: 50px;" onclick="stopAuto()">STOP AUTO MODE</button>
+    </div>
+  </div>
+
+  <!-- 3. LIDAR AUTO CONTROLS -->
+  <div id="lidarControls" class="controls">
+    <div class="card lidarCard">
+      <div style="font-size: 14px; font-weight: 800; color: #a855f7;">2D RPLIDAR AUTONOMOUS NAVIGATION</div>
+      <div style="font-size: 12px; color: #94a3b8; line-height: 1.4;">
+        Raspberry Pi 4B 360° laser sweep with steep-angle detection, omnidirectional gap finding, and smooth skid-steer curves.
+      </div>
+      <button class="btn stop" style="width: 100%; max-width: 280px; height: 50px;" onclick="stopAuto()">STOP LIDAR MODE</button>
+    </div>
+  </div>
+
+  <!-- 4. DUAL FUSION AUTO CONTROLS -->
+  <div id="dualControls" class="controls">
+    <div class="card dualCard">
+      <div style="font-size: 14px; font-weight: 800; color: #f59e0b;">🛡️ DUAL FUSION ACTIVE (ALL SENSORS)</div>
+      <div style="font-size: 12px; color: #94a3b8; line-height: 1.4;">
+        Simultaneous tall & short obstacle detection: 360° RPLiDAR laser mapping on Pi combined with 5x Ultrasonic ground shield on Mega.
+      </div>
+      <button class="btn stop" style="width: 100%; max-width: 280px; height: 50px;" onclick="stopAuto()">STOP DUAL MODE</button>
+    </div>
+  </div>
+
+  <!-- 5. DIAGNOSTICS & SENSOR TEST PANEL -->
+  <div id="testControls" class="controls">
+    <div class="card testCard">
+      <!-- Hardware Link Status -->
+      <div class="diagBadgeGrid">
+        <div class="diagBadge">
+          <div>MEGA 2560</div>
+          <div class="val" id="diagMega">WAIT</div>
+        </div>
+        <div class="diagBadge">
+          <div>RPI / LIDAR</div>
+          <div class="val" id="diagPi">WAIT</div>
+        </div>
+        <div class="diagBadge">
+          <div>US HEALTH</div>
+          <div class="val" id="diagUS">5/5 OK</div>
+        </div>
+      </div>
+
+      <!-- Test Mode Navigation Tabs -->
+      <div class="testTabs">
+        <div class="testTabBtn active" onclick="switchTestTab('all')">ALL US</div>
+        <div class="testTabBtn" onclick="switchTestTab('FC')">▲ FC</div>
+        <div class="testTabBtn" onclick="switchTestTab('FL')">↖ FL</div>
+        <div class="testTabBtn" onclick="switchTestTab('FR')">↗ FR</div>
+        <div class="testTabBtn" onclick="switchTestTab('L')">◀ L</div>
+        <div class="testTabBtn" onclick="switchTestTab('R')">▶ R</div>
+        <div class="testTabBtn" onclick="switchTestTab('radar')">🎯 RADAR</div>
+      </div>
+
+      <!-- Live Ultrasonic Meter Section -->
+      <div id="ultraSection" class="ultraBox">
+        <div style="font-size: 11px; font-weight: 700; color: #64748b;" id="ultraLabel">FRONT-CENTER SENSOR (0°)</div>
+        <div>
+          <span class="ultraReadout" id="ultraNum">--</span>
+          <span class="ultraUnit">cm</span>
+        </div>
+        <div class="ultraBarBox">
+          <div class="ultraBarFill" id="ultraBar"></div>
+        </div>
+        <div class="ultraConesGrid">
+          <div class="coneItem" id="cone_FL" onclick="switchTestTab('FL')"><div class="dir">FL</div><div class="dist" id="val_FL">--</div></div>
+          <div class="coneItem sel" id="cone_FC" onclick="switchTestTab('FC')"><div class="dir">FC</div><div class="dist" id="val_FC">--</div></div>
+          <div class="coneItem" id="cone_FR" onclick="switchTestTab('FR')"><div class="dir">FR</div><div class="dist" id="val_FR">--</div></div>
+          <div class="coneItem" id="cone_L" onclick="switchTestTab('L')"><div class="dir">L</div><div class="dist" id="val_L">--</div></div>
+          <div class="coneItem" id="cone_R" onclick="switchTestTab('R')"><div class="dir">R</div><div class="dist" id="val_R">--</div></div>
+        </div>
+      </div>
+
+      <!-- Live 2D LiDAR Radar Canvas Section -->
+      <div id="radarSection" style="display:none; width: 100%; flex-direction: column; align-items: center;">
+        <!-- Configurable Pi IP bar so phone connects whether on 192.168.4.2 or Home Wi-Fi -->
+        <div style="display:flex; align-items:center; gap:6px; margin:2px 0 4px; width:100%; max-width:330px;">
+          <span style="font-size:11px; font-weight:700; color:#94a3b8;">Pi IP:</span>
+          <input type="text" id="piIpInput" value="192.168.4.2" placeholder="e.g. 192.168.4.2" style="flex:1; background:#0b1519; border:1px solid #1e3a42; border-radius:6px; color:#38bdf8; padding:5px 8px; font-size:12px; font-weight:700; text-align:center;">
+          <button class="testTabBtn" style="min-width:55px; padding:6px 8px;" onclick="savePiIp()">SET</button>
+        </div>
+        <div id="piConnStatus" style="font-size:10px; color:#f59e0b; margin-bottom:6px; font-weight:600;">Connecting to Pi...</div>
+
+        <div style="display:flex; gap:6px; margin-bottom:4px;">
+          <button class="testTabBtn active" style="min-width:55px;" onclick="setRadZoom(1.5, this)">1.5m</button>
+          <button class="testTabBtn" style="min-width:55px;" onclick="setRadZoom(3.0, this)">3.0m</button>
+          <button class="testTabBtn" style="min-width:55px;" onclick="setRadZoom(5.0, this)">5.0m</button>
+        </div>
+        <div class="lidarRadarBox">
+          <canvas id="lidarCanvas" width="400" height="400"></canvas>
+        </div>
+        <div class="radarLegend">
+          <div class="sectorPill"><div class="n">F</div><div class="d" id="radF">--</div></div>
+          <div class="sectorPill"><div class="n">FL</div><div class="d" id="radFL">--</div></div>
+          <div class="sectorPill"><div class="n">FR</div><div class="d" id="radFR">--</div></div>
+          <div class="sectorPill"><div class="n">L</div><div class="d" id="radL">--</div></div>
+          <div class="sectorPill"><div class="n">R</div><div class="d" id="radR">--</div></div>
+          <div class="sectorPill"><div class="n">BL</div><div class="d" id="radBL">--</div></div>
+          <div class="sectorPill"><div class="n">BR</div><div class="d" id="radBR">--</div></div>
+          <div class="sectorPill"><div class="n">B</div><div class="d" id="radB">--</div></div>
+        </div>
+        <div style="font-size: 10px; color: #64748b; margin-top: 6px;">
+          Points: <span id="radarPts">0</span> | Unified Navigator on Port 8088
+        </div>
+      </div>
+
+      <button class="btn stop" style="width: 100%; max-width: 280px; height: 48px; margin-top: 6px;" onclick="stopAuto()">EXIT TEST MODE</button>
+    </div>
+  </div>
+
+  <div class="instructions">
+    <b>Drive Priority:</b> Boots directly in Manual mode.<br>
+    <b>Multi-Touch:</b> Hold 2 buttons — newest takes priority. Release to revert.<br>
+    <b>20x4 LCD:</b> Live status, sensor health, and boot messages on rover display.<br>
+    <b>Sensor Diagnostics:</b> Test live ultrasonics & 2D LiDAR radar mapping.
+  </div>
+</div>
+
+<script>
+let lockedCommand = null;
+let activeCommand = null;
+const DOUBLE_TAP_TIME = 350;
+const ROTATE_HOLD_TIME = 220;
+const buttonStates = new WeakMap();
+const commandURLs = {
+  forward: "/forward",
+  backward: "/backward",
+  rotateLeft: "/rotateLeft",
+  rotateRight: "/rotateRight",
+  rotateLeftStep: "/rotateLeftStep",
+  rotateRightStep: "/rotateRightStep",
+  auto: "/auto",
+  lidar: "/lidar",
+  dual: "/dual",
+  test: "/test"
+};
+
+let pendingUrl = null;
+let isSending = false;
+
+// Multi-Touch Priority Stack
+let touchStack = [];
+
+function getActiveStackCmd() {
+  if (touchStack.length > 0) return touchStack[touchStack.length - 1];
+  return null;
+}
+
+function pushToStack(cmd, button, pointerId) {
+  touchStack = touchStack.filter(e => e.cmd !== cmd);
+  touchStack.push({ cmd, button, pointerId });
+}
+
+function removeFromStack(cmd) {
+  touchStack = touchStack.filter(e => e.cmd !== cmd);
+}
+
+function updateStackVisuals() {
+  document.querySelectorAll(".btn.pressed").forEach(b => b.classList.remove("pressed"));
+  const top = getActiveStackCmd();
+  if (top && !lockedCommand) {
+    top.button.classList.add("pressed");
+  }
+}
+
+function dispatchNext() {
+  if (isSending || !pendingUrl) return;
+  isSending = true;
+  const url = pendingUrl;
+  pendingUrl = null;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 600);
+
+  fetch(url, { method: "GET", cache: "no-store", signal: controller.signal })
+    .catch(() => {})
+    .finally(() => {
+      clearTimeout(timeoutId);
+      isSending = false;
+      if (pendingUrl) {
+        dispatchNext();
+      }
+    });
+}
+
+function sendCommand(command) {
+  if (!commandURLs[command]) return;
+  pendingUrl = commandURLs[command];
+  dispatchNext();
+}
+
+function sendStop() {
+  activeCommand = null;
+  pendingUrl = "/stop";
+  dispatchNext();
+}
+
+function clearLocks() {
+  lockedCommand = null;
+  document.querySelectorAll(".btn.locked").forEach(button => { button.classList.remove("locked"); });
+  updateLockText();
+}
+
+function stopAll() {
+  clearLocks();
+  touchStack = [];
+  document.querySelectorAll(".btn.pressed").forEach(button => { button.classList.remove("pressed"); });
+  sendStop();
+  activeCommand = null;
+}
+
+function lockCommand(command, button) {
+  document.querySelectorAll(".btn.locked").forEach(btn => { btn.classList.remove("locked"); });
+  lockedCommand = command;
+  activeCommand = command;
+  button.classList.add("locked");
+  touchStack = [];
+  sendCommand(command);
+  updateLockText();
+}
+
+function unlockCommand() {
+  lockedCommand = null;
+  document.querySelectorAll(".btn.locked").forEach(button => { button.classList.remove("locked"); });
+  sendStop();
+  updateLockText();
+}
+
+function updateLockText() {
+  const lockText = document.getElementById("lockText");
+  if (lockedCommand) {
+    let readable = lockedCommand.replace("rotateLeft", "Turn Left").replace("rotateRight", "Turn Right").replace("forward", "Forward").replace("backward", "Reverse");
+    lockText.textContent = "LOCKED: " + readable.toUpperCase();
+  } else if (touchStack.length > 1) {
+    lockText.textContent = "MULTI-TOUCH: " + touchStack.length + " buttons held";
+  } else {
+    lockText.textContent = "No movement locked";
+  }
+}
+
+function startCommand(button, command, pointerId) {
+  const state = buttonStates.get(button);
+  if (!state) return;
+
+  if (lockedCommand === command) {
+    unlockCommand();
+    return;
+  }
+  if (lockedCommand && lockedCommand !== command) {
+    clearLocks();
+  }
+
+  const now = Date.now();
+  const isDoubleTap = (now - state.lastTap <= DOUBLE_TAP_TIME);
+
+  if (isDoubleTap) {
+    state.lastTap = 0;
+    clearTimeout(state.holdTimer);
+    clearTimeout(state.stopTimer);
+    lockCommand(command, button);
+    return;
+  }
+
+  const isRotate = (command === "rotateLeft" || command === "rotateRight");
+  pushToStack(command, button, pointerId);
+
+  if (isRotate) {
+    state.isHolding = false;
+    clearTimeout(state.holdTimer);
+    state.holdTimer = setTimeout(() => {
+      if (state.isDown && lockedCommand !== command) {
+        state.isHolding = true;
+        const top = getActiveStackCmd();
+        if (top && top.cmd === command) {
+          activeCommand = command;
+          sendCommand(command);
+        }
+      }
+    }, ROTATE_HOLD_TIME);
+  } else {
+    activeCommand = command;
+    sendCommand(command);
+  }
+
+  updateStackVisuals();
+  updateLockText();
+}
+
+function endCommand(button, command) {
+  const state = buttonStates.get(button);
+  if (!state) return;
+
+  state.isDown = false;
+  clearTimeout(state.holdTimer);
+
+  if (lockedCommand === command) {
+    return;
+  }
+
+  const now = Date.now();
+  const isRotate = (command === "rotateLeft" || command === "rotateRight");
+  removeFromStack(command);
+
+  if (isRotate) {
+    if (state.isHolding) {
+      state.isHolding = false;
+      button.classList.remove("pressed");
+      state.lastTap = 0;
+      const prev = getActiveStackCmd();
+      if (prev) {
+        activeCommand = prev.cmd;
+        sendCommand(prev.cmd);
+        updateStackVisuals();
+      } else {
+        sendStop();
+      }
+    } else {
+      const prev = getActiveStackCmd();
+      if (!prev) {
+        sendCommand(command + "Step");
+        button.classList.add("pressed");
+        setTimeout(() => {
+          if (lockedCommand !== command) {
+            button.classList.remove("pressed");
+          }
+        }, 120);
+      } else {
+        activeCommand = prev.cmd;
+        sendCommand(prev.cmd);
+        updateStackVisuals();
+      }
+      state.lastTap = now;
+    }
+  } else {
+    button.classList.remove("pressed");
+    state.lastTap = now;
+    const prev = getActiveStackCmd();
+    if (prev) {
+      clearTimeout(state.stopTimer);
+      activeCommand = prev.cmd;
+      sendCommand(prev.cmd);
+      updateStackVisuals();
+    } else {
+      clearTimeout(state.stopTimer);
+      state.stopTimer = setTimeout(() => {
+        if (lockedCommand !== command && touchStack.length === 0) {
+          sendStop();
+        }
+      }, DOUBLE_TAP_TIME + 20);
+    }
+  }
+
+  updateLockText();
+}
+
+document.querySelectorAll("[data-command]").forEach(button => {
+  const command = button.dataset.command;
+  const state = { isDown: false, holdTimer: null, stopTimer: null, lastTap: 0, isHolding: false };
+  buttonStates.set(button, state);
+
+  button.addEventListener("pointerdown", function(event) {
+    event.preventDefault();
+    if (event.button !== undefined && event.button !== 0) return;
+    try { button.setPointerCapture(event.pointerId); } catch (e) {}
+    clearTimeout(state.stopTimer);
+    state.isDown = true;
+    startCommand(button, command, event.pointerId);
+  }, { passive: false });
+
+  button.addEventListener("pointerup", function(event) {
+    event.preventDefault();
+    endCommand(button, command);
+  }, { passive: false });
+
+  button.addEventListener("pointercancel", function(event) {
+    event.preventDefault();
+    state.isDown = false;
+    clearTimeout(state.holdTimer);
+    state.isHolding = false;
+    removeFromStack(command);
+    if (lockedCommand !== command) {
+      button.classList.remove("pressed");
+      const prev = getActiveStackCmd();
+      if (prev) {
+        activeCommand = prev.cmd;
+        sendCommand(prev.cmd);
+        updateStackVisuals();
+      } else {
+        sendStop();
+      }
+    }
+    updateLockText();
+  }, { passive: false });
+
+  button.addEventListener("contextmenu", function(event) { event.preventDefault(); });
+});
+
+// Mode Switcher
+let activeMode = "basic";
+let telemTimer = null;
+
+function setMode(mode) {
+  activeMode = mode;
+  clearLocks();
+  document.querySelectorAll(".btn.pressed").forEach(button => { button.classList.remove("pressed"); });
+  activeCommand = null;
+
+  const panels = ["basicControls", "autoControls", "lidarControls", "dualControls", "testControls"];
+  panels.forEach(p => {
+    const el = document.getElementById(p);
+    if (el) el.classList.remove("show");
+  });
+
+  const buttons = ["basicMode", "autoMode", "lidarMode", "dualMode", "testMode"];
+  buttons.forEach(b => {
+    const el = document.getElementById(b);
+    if (el) el.classList.remove("active");
+  });
+
+  const modeText = document.getElementById("modeText");
+
+  if (telemTimer) {
+    clearInterval(telemTimer);
+    telemTimer = null;
+  }
+
+  if (mode === "basic") {
+    document.getElementById("basicControls").classList.add("show");
+    document.getElementById("basicMode").classList.add("active");
+    modeText.textContent = "MANUAL (DRIVE PRIORITY)";
+    sendStop();
+  } else if (mode === "auto") {
+    document.getElementById("autoControls").classList.add("show");
+    document.getElementById("autoMode").classList.add("active");
+    modeText.textContent = "ULTRASONIC AUTO (ACTIVE)";
+    sendCommand("auto");
+  } else if (mode === "lidar") {
+    document.getElementById("lidarControls").classList.add("show");
+    document.getElementById("lidarMode").classList.add("active");
+    modeText.textContent = "2D LIDAR AUTO (ACTIVE)";
+    sendCommand("lidar");
+  } else if (mode === "dual") {
+    document.getElementById("dualControls").classList.add("show");
+    document.getElementById("dualMode").classList.add("active");
+    modeText.textContent = "DUAL FUSION AUTO (ACTIVE)";
+    sendCommand("dual");
+  } else if (mode === "test") {
+    document.getElementById("testControls").classList.add("show");
+    document.getElementById("testMode").classList.add("active");
+    modeText.textContent = "SENSOR DIAGNOSTICS & RADAR (TEST)";
+    sendCommand("test");
+    // Start fast telemetry polling
+    telemTimer = setInterval(pollTelemetry, 180);
+    pollTelemetry();
+  }
+}
+
+function stopAuto() {
+  stopAll();
+  setMode("basic");
+}
+
+// ======================================================
+// SENSOR TEST & DIAGNOSTICS LOGIC
+// ======================================================
+let currentTestTab = "all";
+let latestTelemetry = { fc: 999, fl: 999, fr: 999, l: 999, r: 999, us_count: 5 };
+
+function switchTestTab(tab) {
+  currentTestTab = tab;
+  document.querySelectorAll(".testTabBtn").forEach(b => b.classList.remove("active"));
+  document.querySelectorAll(".coneItem").forEach(c => c.classList.remove("sel"));
+
+  const ultraSec = document.getElementById("ultraSection");
+  const radarSec = document.getElementById("radarSection");
+
+  if (tab === "radar") {
+    ultraSec.style.display = "none";
+    radarSec.style.display = "flex";
+    pollPiRadar();
+  } else {
+    ultraSec.style.display = "flex";
+    radarSec.style.display = "none";
+
+    const cone = document.getElementById("cone_" + tab);
+    if (cone) cone.classList.add("sel");
+  }
+
+  // Highlight active tab
+  event && event.target && event.target.classList.add("active");
+  updateUltraDisplay();
+}
+
+function updateUltraDisplay() {
+  const lbl = document.getElementById("ultraLabel");
+  const num = document.getElementById("ultraNum");
+  const bar = document.getElementById("ultraBar");
+
+  let dist = 999;
+  let name = "ALL 5 SENSORS ACTIVE";
+
+  if (currentTestTab === "FC" || currentTestTab === "all") {
+    dist = latestTelemetry.fc;
+    name = "FRONT-CENTER SENSOR (0°)";
+  } else if (currentTestTab === "FL") {
+    dist = latestTelemetry.fl;
+    name = "FRONT-LEFT SENSOR (30°)";
+  } else if (currentTestTab === "FR") {
+    dist = latestTelemetry.fr;
+    name = "FRONT-RIGHT SENSOR (30°)";
+  } else if (currentTestTab === "L") {
+    dist = latestTelemetry.l;
+    name = "LEFT SIDE SENSOR (90°)";
+  } else if (currentTestTab === "R") {
+    dist = latestTelemetry.r;
+    name = "RIGHT SIDE SENSOR (90°)";
+  }
+
+  lbl.textContent = name;
+  if (dist >= 990) {
+    num.textContent = "CLEAR";
+    bar.style.width = "100%";
+    bar.style.background = "#10b981";
+  } else {
+    num.textContent = dist;
+    const pct = Math.min(100, Math.max(5, (dist / 150) * 100));
+    bar.style.width = pct + "%";
+    bar.style.background = dist < 15 ? "#ef4444" : (dist < 35 ? "#f59e0b" : "#06b6d4");
+  }
+}
+
+async function pollTelemetry() {
+  try {
+    const res = await fetch("/telemetry");
+    if (res.ok) {
+      const data = await res.json();
+
+      // Proximity Alert Banner in All Driving Modes (only active when fleet tracking is ON)
+      const pBox = document.getElementById("proxAlertBox");
+      const pRssi = document.getElementById("proxRssiVal");
+      if (data.prox_alert === 1 && data.fleet_enabled === 1) {
+        if (pBox) pBox.style.display = "block";
+        if (pRssi) pRssi.textContent = data.prox_rssi;
+      } else {
+        if (pBox) pBox.style.display = "none";
+      }
+
+      // Live Rover #2 signal readout in Fleet Settings
+      const fRssi = document.getElementById("fleetLiveRssi");
+      if (fRssi) {
+        if (data.prox_rssi && data.prox_rssi > -990) {
+          currentLiveRssi = data.prox_rssi;
+          fRssi.textContent = data.prox_rssi + " dBm (DETECTED)";
+          fRssi.style.color = (data.prox_rssi >= data.prox_stop_thresh) ? "#ef4444" : "#10b981";
+        } else {
+          fRssi.textContent = "-- dBm (OUT OF RANGE)";
+          fRssi.style.color = "#64748b";
+        }
+      }
+
+      const pThresh = document.getElementById("proxThreshDisp");
+      if (pThresh && data.prox_stop_thresh) pThresh.textContent = data.prox_stop_thresh;
+
+      if (activeMode !== "test") return;
+
+      latestTelemetry = data;
+
+      // Update badge states
+      const dMega = document.getElementById("diagMega");
+      const dPi = document.getElementById("diagPi");
+      const dUS = document.getElementById("diagUS");
+
+      dMega.textContent = data.mega_online ? "ONLINE" : "WAIT";
+      dMega.className = "val " + (data.mega_online ? "ok" : "wait");
+
+      dPi.textContent = data.rpi_ok ? "ONLINE" : "WAIT";
+      dPi.className = "val " + (data.rpi_ok ? "ok" : "wait");
+
+      dUS.textContent = data.us_count + "/5 OK";
+      dUS.className = "val " + (data.us_count === 5 ? "ok" : (data.us_count >= 3 ? "wait" : "err"));
+
+      // Update cone distances
+      function setVal(id, v) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = (v >= 990) ? "CLR" : v + "cm";
+      }
+      setVal("val_FC", data.fc);
+      setVal("val_FL", data.fl);
+      setVal("val_FR", data.fr);
+      setVal("val_L", data.l);
+      setVal("val_R", data.r);
+
+      updateUltraDisplay();
+
+      // Unpack 36 LiDAR rays received via wire (RPi -> Mega -> ESP8266)
+      if (data.rays && data.rays.length === 36) {
+        lastLidarPoints = [];
+        for (let i = 0; i < 36; i++) {
+          const dist = data.rays[i];
+          if (dist > 12 && dist < 550) {
+            const angle = i * 10;
+            const rad = angle * Math.PI / 180;
+            const x = dist * Math.sin(rad);
+            const y = dist * Math.cos(rad);
+            lastLidarPoints.push([angle, dist, x, y]);
+          }
+        }
+        const ptsEl = document.getElementById("radarPts");
+        if (ptsEl) ptsEl.textContent = lastLidarPoints.length;
+
+        const connEl = document.getElementById("piConnStatus");
+        if (connEl) {
+          connEl.textContent = "● WIRED LINK ACTIVE (RPi -> Mega -> ESP | " + lastLidarPoints.length + " pts)";
+          connEl.style.color = "#10b981";
+        }
+
+        if (data.sectors) {
+          function sVal(id, v) {
+            const el = document.getElementById(id);
+            if (el) el.textContent = (v >= 900) ? "CLR" : Math.round(v) + "cm";
+          }
+          sVal("radF", data.sectors.F);
+          sVal("radFL", data.sectors.FL);
+          sVal("radFR", data.sectors.FR);
+          sVal("radL", data.sectors.L);
+          sVal("radR", data.sectors.R);
+          sVal("radBL", data.sectors.BL);
+          sVal("radBR", data.sectors.BR);
+          sVal("radB", data.sectors.B);
+        }
+
+        if (currentTestTab === "radar") {
+          renderRadarCanvas();
+        }
+      }
+    }
+  } catch (e) {}
+
+  // Optional direct Pi Wi-Fi fetch fallback (only if wired points are empty)
+  if (lastLidarPoints.length === 0) {
+    pollPiRadar();
+  }
+}
+
+// ======================================================
+// 2D LIDAR RADAR MAP CANVAS
+// ======================================================
+const radarCanvas = document.getElementById("lidarCanvas");
+const rCtx = radarCanvas ? radarCanvas.getContext("2d") : null;
+let radarSweepAngle = 0;
+let lastLidarPoints = [];
+let targetPiIp = localStorage.getItem("rover_pi_ip") || "192.168.4.2";
+
+function savePiIp() {
+  const inp = document.getElementById("piIpInput");
+  if (inp && inp.value.trim()) {
+    targetPiIp = inp.value.trim();
+    localStorage.setItem("rover_pi_ip", targetPiIp);
+    const connEl = document.getElementById("piConnStatus");
+    if (connEl) {
+      connEl.textContent = "Connecting to http://" + targetPiIp + ":8088...";
+      connEl.style.color = "#f59e0b";
+    }
+    pollPiRadar();
+  }
+}
+
+async function pollPiRadar() {
+  if (activeMode !== "test" || currentTestTab !== "radar") return;
+
+  const url = "http://" + targetPiIp + ":8088/lidar_scan";
+  const connEl = document.getElementById("piConnStatus");
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 900);
+    const piRes = await fetch(url, { mode: 'cors', signal: controller.signal });
+    clearTimeout(timeoutId);
+
+    if (piRes.ok) {
+      const pData = await piRes.json();
+      lastLidarPoints = pData.points || [];
+      const ptsEl = document.getElementById("radarPts");
+      if (ptsEl) ptsEl.textContent = lastLidarPoints.length;
+
+      if (connEl) {
+        const modeStr = pData.is_navigating ? ("NAVIGATING [" + pData.current_cmd + "]") : "STANDBY";
+        connEl.textContent = "● CONNECTED: " + targetPiIp + " (" + lastLidarPoints.length + " pts | " + modeStr + ")";
+        connEl.style.color = "#10b981";
+      }
+
+      if (pData.sectors) {
+        function sVal(id, v) {
+          const el = document.getElementById(id);
+          if (el) el.textContent = (v >= 900) ? "CLR" : Math.round(v) + "cm";
+        }
+        sVal("radF", pData.sectors.F);
+        sVal("radFL", pData.sectors.FL);
+        sVal("radFR", pData.sectors.FR);
+        sVal("radL", pData.sectors.L);
+        sVal("radR", pData.sectors.R);
+        sVal("radBL", pData.sectors.BL);
+        sVal("radBR", pData.sectors.BR);
+        sVal("radB", pData.sectors.B);
+      }
+    } else {
+      if (connEl) {
+        connEl.textContent = "○ HTTP " + piRes.status + " from " + url;
+        connEl.style.color = "#ef4444";
+      }
+    }
+  } catch (e) {
+    if (connEl) {
+      connEl.textContent = "○ Cannot reach " + url + " (Set Pi IP above)";
+      connEl.style.color = "#ef4444";
+    }
+  }
+
+  renderRadarCanvas();
+}
+
+let radarZoomMax = 1.5;
+
+function setRadZoom(m, btn) {
+  radarZoomMax = m;
+  document.querySelectorAll('#radarSection .testTabBtn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderRadarCanvas();
+}
+
+function renderRadarCanvas() {
+  if (!rCtx || !radarCanvas) return;
+  const W = radarCanvas.width, H = radarCanvas.height;
+  const CX = W / 2, CY = H / 2;
+  const SCALE = (W / 2 - 16) / (radarZoomMax * 100);
+
+  rCtx.fillStyle = "#05070a";
+  rCtx.fillRect(0, 0, W, H);
+
+  // Concentric Range Rings
+  rCtx.lineWidth = 1;
+  const step = radarZoomMax <= 2.0 ? 0.5 : 1.0;
+  for (let r = step; r <= radarZoomMax; r += step) {
+    const rad = r * 100 * SCALE;
+    rCtx.strokeStyle = "#162832";
+    rCtx.beginPath();
+    rCtx.arc(CX, CY, rad, 0, Math.PI * 2);
+    rCtx.stroke();
+
+    rCtx.fillStyle = "#64748b";
+    rCtx.font = "10px sans-serif";
+    rCtx.fillText(r.toFixed(1) + "m", CX + 4, CY - rad + 11);
+  }
+
+  // Crosshair Axes
+  rCtx.strokeStyle = "#162832";
+  rCtx.beginPath();
+  rCtx.moveTo(CX, 0); rCtx.lineTo(CX, H);
+  rCtx.moveTo(0, CY); rCtx.lineTo(W, CY);
+  rCtx.stroke();
+
+  // Rotating Radar Sweep Beam
+  radarSweepAngle = (radarSweepAngle + 0.08) % (Math.PI * 2);
+  const sx = CX + (CX - 12) * Math.sin(radarSweepAngle);
+  const sy = CY - (CY - 12) * Math.cos(radarSweepAngle);
+  rCtx.strokeStyle = "rgba(6, 182, 212, 0.4)";
+  rCtx.lineWidth = 2;
+  rCtx.beginPath();
+  rCtx.moveTo(CX, CY);
+  rCtx.lineTo(sx, sy);
+  rCtx.stroke();
+
+  // Green Dotted Laser Points (Walls & Objects)
+  if (lastLidarPoints.length > 0) {
+    lastLidarPoints.forEach(pt => {
+      const x = pt[2], y = pt[3], d = pt[1];
+      const px = CX + x * SCALE;
+      const py = CY - y * SCALE;
+
+      rCtx.fillStyle = d < 25 ? "#ef4444" : (d < 45 ? "#f59e0b" : "#10b981");
+      rCtx.beginPath();
+      rCtx.arc(px, py, 3.0, 0, Math.PI * 2);
+      rCtx.fill();
+    });
+  }
+
+  // Compact Center Rover Marker (Small 4px dot)
+  rCtx.fillStyle = "#06b6d4";
+  rCtx.beginPath();
+  rCtx.arc(CX, CY, 4, 0, Math.PI * 2);
+  rCtx.fill();
+
+  // Red Heading Arrow (Forward = 0°)
+  rCtx.strokeStyle = "#ef4444";
+  rCtx.fillStyle = "#ef4444";
+  rCtx.lineWidth = 2;
+  rCtx.beginPath();
+  rCtx.moveTo(CX, CY);
+  rCtx.lineTo(CX, CY - 14);
+  rCtx.stroke();
+
+  rCtx.beginPath();
+  rCtx.moveTo(CX, CY - 18);
+  rCtx.lineTo(CX - 4, CY - 12);
+  rCtx.lineTo(CX + 4, CY - 12);
+  rCtx.closePath();
+  rCtx.fill();
+}
+
+document.addEventListener("touchmove", function(event) {
+  if (event.target.closest(".btn")) { event.preventDefault(); }
+}, { passive: false });
+
+// Restore saved Pi IP
+const savedPiIp = localStorage.getItem("rover_pi_ip");
+if (savedPiIp) {
+  targetPiIp = savedPiIp;
+  const inp = document.getElementById("piIpInput");
+  if (inp) inp.value = savedPiIp;
+}
+
+// ======================================================
+// FLEET ROVER AVOIDANCE JAVASCRIPT CONTROLLERS
+// ======================================================
+let fleetEnabled = true;
+let currentStopThresh = -48;
+let currentLiveRssi = -999;
+
+function updateFleetVisuals() {
+  const btn = document.getElementById("fleetToggleBtn");
+  const sub = document.getElementById("fleetSub");
+  if (fleetEnabled) {
+    if (btn) { btn.className = "fleetToggle on"; btn.textContent = "ON"; }
+    if (sub) { sub.textContent = "ACTIVE (CLOSE-RANGE SAFETY STOP)"; sub.style.color = "#10b981"; }
+  } else {
+    if (btn) { btn.className = "fleetToggle off"; btn.textContent = "OFF"; }
+    if (sub) { sub.textContent = "DISABLED (OTHER ROVERS IGNORED)"; sub.style.color = "#94a3b8"; }
+    const pBox = document.getElementById("proxAlertBox");
+    if (pBox) pBox.style.display = "none";
+  }
+}
+
+function toggleFleetAvoidance() {
+  fleetEnabled = !fleetEnabled;
+  updateFleetVisuals();
+  fetch("/set_fleet?enabled=" + (fleetEnabled ? "1" : "0") + "&thresh=" + currentStopThresh).catch(()=>{});
+}
+
+function toggleFleetSettings() {
+  const p = document.getElementById("fleetSettingsPanel");
+  if (p) p.style.display = (p.style.display === "none") ? "block" : "none";
+}
+
+function updateThreshLabel() {
+  const lbl = document.getElementById("threshLabel");
+  let desc = "CUSTOM";
+  if (currentStopThresh >= -42) desc = "VERY NEAR (~0.7m)";
+  else if (currentStopThresh >= -50) desc = "CLOSE (~1.2m)";
+  else if (currentStopThresh >= -58) desc = "MEDIUM (~1.8m)";
+  else desc = "FAR (~2.5m+)";
+  if (lbl) lbl.textContent = currentStopThresh + " dBm (" + desc + ")";
+
+  const pThresh = document.getElementById("proxThreshDisp");
+  if (pThresh) pThresh.textContent = currentStopThresh;
+
+  document.querySelectorAll(".presetBtn").forEach(b => b.classList.remove("active"));
+  if (currentStopThresh === -40) document.getElementById("pre_vclose")?.classList.add("active");
+  else if (currentStopThresh === -48) document.getElementById("pre_close")?.classList.add("active");
+  else if (currentStopThresh === -55) document.getElementById("pre_med")?.classList.add("active");
+  else if (currentStopThresh === -62) document.getElementById("pre_far")?.classList.add("active");
+}
+
+function onSliderChange(val) {
+  currentStopThresh = parseInt(val);
+  updateThreshLabel();
+  fetch("/set_fleet?enabled=" + (fleetEnabled ? "1" : "0") + "&thresh=" + currentStopThresh).catch(()=>{});
+}
+
+function setRangePreset(val, name) {
+  currentStopThresh = val;
+  const slider = document.getElementById("proxSlider");
+  if (slider) slider.value = val;
+  updateThreshLabel();
+  fetch("/set_fleet?enabled=" + (fleetEnabled ? "1" : "0") + "&thresh=" + currentStopThresh).catch(()=>{});
+}
+
+function calibrateAtCurrentDistance() {
+  if (currentLiveRssi > -80 && currentLiveRssi < -30) {
+    currentStopThresh = currentLiveRssi;
+    const slider = document.getElementById("proxSlider");
+    if (slider) slider.value = currentStopThresh;
+    updateThreshLabel();
+    fetch("/set_fleet?enabled=" + (fleetEnabled ? "1" : "0") + "&thresh=" + currentStopThresh).catch(()=>{});
+    alert("Calibrated! Rover will now stop at " + currentLiveRssi + " dBm.");
+  } else {
+    alert("Rover #2 beacon not in range! Bring the 2nd ESP to your desired distance first.");
+  }
+}
+
+// Continual telemetry poll for proximity alerts across all driving modes
+setInterval(pollTelemetry, 350);
+
+// Boot in default Drive Priority mode (MANUAL)
+setMode("basic");
+</script>
+</body>
+</html>
+)rawliteral";
+
+
+// ======================================================
+// HTTP HANDLERS
+// ======================================================
+
+void handleRoot() {
+  server.sendHeader("Connection", "close");
+  server.send_P(200, "text/html", MAIN_PAGE);
+}
+
+void sendFastOk() {
+  server.sendHeader("Connection", "close");
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  server.send(200, "text/plain", "1");
+}
+
+void handleForward()        { Serial.print('F'); sendFastOk(); }
+void handleBackward()       { Serial.print('B'); sendFastOk(); }
+void handleLeft()           { Serial.print('L'); sendFastOk(); }
+void handleRight()          { Serial.print('R'); sendFastOk(); }
+void handleRotateLeft()     { Serial.print('Q'); sendFastOk(); }
+void handleRotateRight()    { Serial.print('E'); sendFastOk(); }
+void handleRotateLeftStep()  { Serial.print('q'); sendFastOk(); }
+void handleRotateRightStep() { Serial.print('e'); sendFastOk(); }
+void handleStop()           { Serial.print('S'); sendFastOk(); }
+void handleAuto()           { Serial.print('A'); sendFastOk(); }
+void handleLidar()          { Serial.print('D'); sendFastOk(); }
+void handleDual()           { Serial.print('H'); sendFastOk(); }
+void handleTest()           { Serial.print('T'); sendFastOk(); }
+
+void handleTelemetry() {
+  server.sendHeader("Connection", "close");
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+
+  unsigned long now = millis();
+  bool megaOnline = (lastMegaTelemTime > 0 && (now - lastMegaTelemTime < 3500));
+  bool rpiOnline = (telemRpiOk == 1) || (lastLidarRaysTime > 0 && (now - lastLidarRaysTime < 3000));
+  bool lidarOnline = (telemLidarOk == 1) || (lastLidarRaysTime > 0 && (now - lastLidarRaysTime < 3000));
+
+  String json = "{";
+  json += "\"fc\":" + String(telemFC) + ",";
+  json += "\"fl\":" + String(telemFL) + ",";
+  json += "\"fr\":" + String(telemFR) + ",";
+  json += "\"l\":" + String(telemL) + ",";
+  json += "\"r\":" + String(telemR) + ",";
+  json += "\"us_count\":" + String(telemUSCount) + ",";
+  json += "\"rpi_ok\":" + String(rpiOnline ? 1 : 0) + ",";
+  json += "\"lidar_ok\":" + String(lidarOnline ? 1 : 0) + ",";
+  json += "\"mega_online\":" + String(megaOnline ? 1 : 0) + ",";
+  json += "\"mode\":" + String(telemMode) + ",";
+  json += "\"prox_alert\":" + String(roverProximityAlert ? 1 : 0) + ",";
+  json += "\"prox_rssi\":" + String(lastRoverRssi) + ",";
+  json += "\"fleet_enabled\":" + String(fleetTrackingEnabled ? 1 : 0) + ",";
+  json += "\"prox_stop_thresh\":" + String(rssiStopThreshold) + ",";
+  json += "\"prox_resume_thresh\":" + String(rssiResumeThreshold) + ",";
+  json += "\"mega_prox_hold\":" + String(telemMegaProxHold) + ",";
+
+  // 36-ray LiDAR distances for 2D room map over wire (RPi -> Mega -> ESP)
+  json += "\"rays\":[";
+  for (int i = 0; i < 36; i++) {
+    json += String(lidarRays[i]);
+    if (i < 35) json += ",";
+  }
+  json += "],";
+
+  // 8 sector minimums
+  int sF  = lidarRays[0];
+  int sFL = min(lidarRays[4], lidarRays[5]);
+  int sL  = lidarRays[9];
+  int sBL = min(lidarRays[13], lidarRays[14]);
+  int sB  = lidarRays[18];
+  int sBR = min(lidarRays[22], lidarRays[23]);
+  int sR  = lidarRays[27];
+  int sFR = min(lidarRays[31], lidarRays[32]);
+
+  json += "\"sectors\":{";
+  json += "\"F\":" + String(sF) + ",";
+  json += "\"FL\":" + String(sFL) + ",";
+  json += "\"L\":" + String(sL) + ",";
+  json += "\"BL\":" + String(sBL) + ",";
+  json += "\"B\":" + String(sB) + ",";
+  json += "\"BR\":" + String(sBR) + ",";
+  json += "\"R\":" + String(sR) + ",";
+  json += "\"FR\":" + String(sFR);
+  json += "}";
+
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSetFleet() {
+  server.sendHeader("Connection", "close");
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (server.hasArg("enabled")) {
+    fleetTrackingEnabled = (server.arg("enabled") == "1");
+    if (!fleetTrackingEnabled && roverProximityAlert) {
+      roverProximityAlert = false;
+      proximityConsecutiveHits = 0;
+      Serial.print('p'); // Unfreeze Mega immediately
+    }
+  }
+  if (server.hasArg("thresh")) {
+    int t = server.arg("thresh").toInt();
+    if (t >= -75 && t <= -35) {
+      rssiStopThreshold = t;
+      rssiResumeThreshold = t - 8;
+    }
+  }
+  sendFastOk();
+}
+
+void handleNotFound() {
+  server.sendHeader("Connection", "close");
+  server.send(404, "text/plain", "Not Found");
+}
+
+// ======================================================
+// TELEMETRY PARSER (from Arduino Mega Serial1 TX1)
+// ======================================================
+void parseMegaTelemetry(String line) {
+  // Format: "fc,fl,fr,l,r,healthy_count,rpi_ok,lidar_ok,mode,prox_hold"
+  int vals[10];
+  int idx = 0;
+  int start = 0;
+  for (int i = 0; i <= line.length() && idx < 10; i++) {
+    if (i == line.length() || line.charAt(i) == ',') {
+      vals[idx++] = line.substring(start, i).toInt();
+      start = i + 1;
+    }
+  }
+  if (idx >= 6) {
+    telemFC = vals[0];
+    telemFL = vals[1];
+    telemFR = vals[2];
+    telemL  = vals[3];
+    telemR  = vals[4];
+    telemUSCount = vals[5];
+    if (idx >= 7) telemRpiOk = vals[6];
+    if (idx >= 8) telemLidarOk = vals[7];
+    if (idx >= 9) telemMode = vals[8];
+    if (idx >= 10) telemMegaProxHold = vals[9];
+    lastMegaTelemTime = millis();
+  }
+}
+
+void parseLidarTelemetry(String line) {
+  // Format: "d0,d1,d2,...,d35"
+  int idx = 0;
+  int start = 0;
+  for (int i = 0; i <= line.length() && idx < 36; i++) {
+    if (i == line.length() || line.charAt(i) == ',') {
+      lidarRays[idx++] = line.substring(start, i).toInt();
+      start = i + 1;
+    }
+  }
+  if (idx >= 36) {
+    lastLidarRaysTime = millis();
+    telemRpiOk = 1;
+    telemLidarOk = 1;
+  }
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  for (int i = 0; i < 36; i++) lidarRays[i] = 999;
+
+  Serial.begin(115200);
+  delay(100);
+
+  Serial.println();
+  Serial.println("==============================================");
+  Serial.println(" ESP8266 MOTOR CONTROLLER & DIAGNOSTICS WEB");
+  Serial.println("==============================================");
+
+  // Robust Wi-Fi AP+STA Initialization (AP for Phone Remote, STA for Channel 1 Beacon Scan)
+  WiFi.persistent(false);
+  WiFi.disconnect(true);
+  delay(150);
+  WiFi.mode(WIFI_AP_STA);
+  delay(100);
+
+  // Configure AP network IP: 192.168.4.1
+  IPAddress apIP(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(apIP, apIP, subnet);
+  
+  // Start Access Point: Channel 1 (universal standard), visible, max 4 clients
+  bool apSuccess = WiFi.softAP("MECANUM_CAR", "12345678", 1, 0, 4);
+  WiFi.setOutputPower(20.5); // Maximum transmission power for strong range
+
+  if (apSuccess) {
+    Serial.println(F("[WIFI] AP 'MECANUM_CAR' started successfully on Channel 1!"));
+    Serial.print(F("[WIFI] IP Address: "));
+    Serial.println(WiFi.softAPIP());
+    for (int i = 0; i < 3; i++) {
+      digitalWrite(LED_BUILTIN, LOW);
+      delay(80);
+      digitalWrite(LED_BUILTIN, HIGH);
+      delay(80);
+    }
+    digitalWrite(LED_BUILTIN, LOW); // Solid ON = Wi-Fi AP Live
+  } else {
+    Serial.println(F("[WIFI] ERROR: Failed to start Access Point!"));
+  }
+
+  // HTTP Routes
+  server.on("/", handleRoot);
+  server.on("/forward", handleForward);
+  server.on("/backward", handleBackward);
+  server.on("/left", handleLeft);
+  server.on("/right", handleRight);
+  server.on("/rotateLeft", handleRotateLeft);
+  server.on("/rotateRight", handleRotateRight);
+  server.on("/rotateLeftStep", handleRotateLeftStep);
+  server.on("/rotateRightStep", handleRotateRightStep);
+  server.on("/stop", handleStop);
+  server.on("/auto", handleAuto);
+  server.on("/lidar", handleLidar);
+  server.on("/dual", handleDual);
+  server.on("/test", handleTest);
+  server.on("/telemetry", handleTelemetry);
+  server.on("/set_fleet", handleSetFleet);
+  server.onNotFound(handleNotFound);
+
+  server.begin();
+  Serial.println(F("HTTP Server ready at http://192.168.4.1"));
+}
+
+// ======================================================
+// BACKGROUND ROVER-TO-ROVER PROXIMITY SCANNER (CHANNEL 1)
+// ======================================================
+void checkRoverProximity() {
+  unsigned long now = millis();
+
+  // If Fleet Tracking is disabled by user on web remote:
+  if (!fleetTrackingEnabled) {
+    proximityConsecutiveHits = 0;
+    if (roverProximityAlert) {
+      roverProximityAlert = false;
+      Serial.print('p'); // Immediately unfreeze Mega
+    }
+    return;
+  }
+
+  // 1. Trigger asynchronous scan on Channel 1 every 250ms
+  // Staying on Channel 1 means the radio NEVER hops channels, keeping AP/Web alive!
+  if (!isScanning) {
+    if (now - lastScanStartTime >= 250) {
+      int8_t res = WiFi.scanNetworks(true /* async */, true /* show_hidden */, 1 /* channel 1 */);
+      if (res == WIFI_SCAN_RUNNING || res >= 0) {
+        isScanning = true;
+        lastScanStartTime = now;
+      }
+    }
+  } else {
+    // 2. Check if the asynchronous channel 1 scan has completed
+    int16_t n = WiFi.scanComplete();
+    if (n >= 0) {
+      isScanning = false;
+      bool foundTarget = false;
+      int strongestRssi = -999;
+
+      for (int i = 0; i < n; i++) {
+        if (WiFi.SSID(i) == TARGET_ROVER_BEACON) {
+          foundTarget = true;
+          strongestRssi = WiFi.RSSI(i);
+          break;
+        }
+      }
+      WiFi.scanDelete(); // Critical: prevent internal memory leak
+
+      // 3. Proximity Decision Logic with 2-hit Debounce Filter & Hysteresis
+      if (foundTarget) {
+        lastBeaconSeenTime = now;
+        lastRoverRssi = strongestRssi;
+
+        // Signal stronger than Stop Threshold (e.g. -48 dBm)
+        if (strongestRssi >= rssiStopThreshold) {
+          if (proximityConsecutiveHits < 255) proximityConsecutiveHits++;
+          // Require 2 consecutive strong hits so single RF noise spike does not freeze rover
+          if (!roverProximityAlert && proximityConsecutiveHits >= 2) {
+            roverProximityAlert = true;
+            Serial.print('P'); // Signal Arduino Mega: PROXIMITY SAFETY STOP!
+          }
+        }
+        // Signal weaker than Resume Threshold (e.g. -56 dBm) -> Clear Stop
+        else if (strongestRssi < rssiResumeThreshold) {
+          proximityConsecutiveHits = 0;
+          if (roverProximityAlert) {
+            roverProximityAlert = false;
+            Serial.print('p'); // Signal Arduino Mega: PROXIMITY CLEAR, RESUME!
+          }
+        } else {
+          // In the deadband between stop and resume
+          if (!roverProximityAlert) proximityConsecutiveHits = 0;
+        }
+      } else {
+        // Beacon not detected in this scan - check timeout
+        lastRoverRssi = -999;
+        proximityConsecutiveHits = 0;
+        if (roverProximityAlert && (now - lastBeaconSeenTime > BEACON_TIMEOUT_MS)) {
+          roverProximityAlert = false;
+          Serial.print('p'); // Signal Arduino Mega: PROXIMITY CLEAR, RESUME!
+        }
+      }
+    } else if (n == WIFI_SCAN_FAILED) {
+      isScanning = false;
+    }
+  }
+}
+
+// ======================================================
+// LOOP
+// ======================================================
+
+void loop() {
+  server.handleClient();
+  checkRoverProximity(); // Non-blocking background rover proximity check
+
+  // FAILSAFE RESYNC: If Mega says it is currently in safety hold, but ESP has NO alert
+  // or Fleet Tracking is disabled, immediately send 'p' to release it!
+  if (telemMegaProxHold == 1 && (!roverProximityAlert || !fleetTrackingEnabled)) {
+    Serial.print('p');
+  }
+
+  // Read Telemetry stream from Arduino Mega safely
+  // (Bound to at most 128 bytes per pass to prevent starving the Wi-Fi beacon)
+  int bytesRead = 0;
+  while (Serial.available() > 0 && bytesRead < 128) {
+    bytesRead++;
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (megaSerialBuf.startsWith("U:")) {
+        parseMegaTelemetry(megaSerialBuf.substring(2));
+      } else if (megaSerialBuf.startsWith("L:")) {
+        parseLidarTelemetry(megaSerialBuf.substring(2));
+      }
+      megaSerialBuf = "";
+    } else {
+      megaSerialBuf += c;
+      if (megaSerialBuf.length() > 240) megaSerialBuf = "";
+    }
+  }
+
+  yield(); // Crucial: Yields CPU to ESP8266 background WiFi stack & resets software watchdog
+}
