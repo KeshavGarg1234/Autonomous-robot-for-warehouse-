@@ -1,14 +1,26 @@
 #include <Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
 // ======================================================
 // ARDUINO MEGA - 4WD NORMAL WHEEL (SKID-STEER) CONTROLLER
-// Compatible with untouched ESP8266 Web UI & RPi lidar_navigator.py v4.0
+// Version: 4.6 - Zero-Lag High-Speed Navigation & Diagnostics
 // ======================================================
 // Modes (from ESP8266 on Serial1, Pin 19 @ 115200):
-//   Manual      : F, B, L, R, Q, E, q, e, S
+//   Manual      : F, B, L, R, Q, E, q, e, S, M
 //   Ultrasonic  : A (5x HC-SR04 autonomous)
 //   2D LiDAR    : D (RPi 4B RPLiDAR autonomous)
 //   Dual Fusion : H (RPi 4B RPLiDAR + 5x HC-SR04 ground shield)
+//   Test / Diag : T (Sensor health, live telemetry stream, motors stopped)
+//
+// Telemetry Output (to ESP8266 on Serial1 Pin 18 TX1 via 10k/20k divider):
+//   Format: "U:fc,fl,fr,l,r,healthy_count,rpi_ok,lidar_ok,mode\n"
+//
+// 20x4 I2C LCD (SDA -> Pin 20, SCL -> Pin 21):
+//   Row 0: [ROVER] <MODE>
+//   Row 1: ESP: OK/WAIT | RPi: OK/WAIT
+//   Row 2: US: 5/5 OK   | LDR: OK/WAIT
+//   Row 3: Live distance metrics or action telemetry
 // ======================================================
 
 // MOTOR PINS (2x L298N Dual H-Bridge, Standard 4WD Skid-Steer)
@@ -24,8 +36,8 @@
 // ULTRASONIC SENSOR PINS (5x HC-SR04)
 #define TRIG_FC 38
 #define ECHO_FC 39
-#define TRIG_FL 40
-#define ECHO_FL 41
+#define TRIG_FL 52  // Reassigned from pin 40 to Pin 52 (Outer row, right next to GND)
+#define ECHO_FL 53  // Reassigned from pin 41 to Pin 53 (Inner row, right next to 5V)
 #define TRIG_FR 42
 #define ECHO_FR 43
 #define TRIG_L  44
@@ -52,13 +64,21 @@ int servoDirection = 1;
 unsigned long lastServoStepTime = 0;
 
 // ======================================================
+// 20x4 I2C LCD HARDWARE
+// ======================================================
+LiquidCrystal_I2C* activeLcd = nullptr;
+bool lcdFound = false;
+unsigned long lastLcdUpdateTime = 0;
+
+// ======================================================
 // OPERATING MODES & STATES
 // ======================================================
 enum RoverMode {
   MODE_MANUAL,
   MODE_ULTRASONIC,
   MODE_LIDAR,
-  MODE_DUAL_FUSION
+  MODE_DUAL_FUSION,
+  MODE_TEST
 };
 
 enum AutoState {
@@ -72,6 +92,9 @@ RoverMode currentMode = MODE_MANUAL;
 AutoState autoState = AUTO_IDLE;
 int turnDirection = 1; // -1 = Left, 1 = Right
 unsigned long autoStateStartTime = 0;
+
+// Proximity Safety Interlock (Rover-to-Rover Collision Avoidance)
+bool isProximityHold = false;
 
 // ======================================================
 // SENSOR & SAFETY THRESHOLDS
@@ -88,7 +111,7 @@ const int DUAL_FRONT_CM      = 26;
 const int DUAL_CLEAR_CM      = 36;
 const int DUAL_SIDE_CM       = 16;
 
-// Round-robin ultrasonic polling (non-blocking for 115200 baud serial)
+// Round-robin ultrasonic polling (non-blocking)
 const unsigned long SENSOR_POLL_INTERVAL_MS = 15;
 unsigned long lastSensorPollTime = 0;
 uint8_t nextSensorIdx = 0;
@@ -98,6 +121,11 @@ long distFL = 999;
 long distFR = 999;
 long distL  = 999;
 long distR  = 999;
+
+// Ultrasonic Sensor Health & Fault-Tolerance
+uint8_t sensorFailCount[5] = {0, 0, 0, 0, 0};
+bool sensorHealthy[5] = {true, true, true, true, true};
+uint8_t healthySensorCount = 5;
 
 // Dual Fusion override state
 enum DualOverrideState {
@@ -110,9 +138,12 @@ unsigned long dualOverrideStart = 0;
 int dualTurnDir = 1;
 char lastPiCmd = 'S';
 
-// LiDAR Watchdog & Resync
+// LiDAR & Link Watchdogs
 unsigned long lastLidarCmdTime = 0;
 unsigned long lastLidarResyncTime = 0;
+unsigned long lastEspCmdTime = 0;
+unsigned long lastPiMsgTime = 0;
+unsigned long lastTelemetrySendTime = 0;
 const unsigned long LIDAR_TIMEOUT_MS = 1500;
 const unsigned long LIDAR_RESYNC_INTERVAL = 2500;
 
@@ -121,16 +152,19 @@ const unsigned long ROTATION_STEP_MS = 280;
 unsigned long stepEndTime = 0;
 bool isStepping = false;
 
-// ======================================================
-// FORWARD DECLARATIONS
-// ======================================================
+// Serial Buffer for Pi Test Mode Telemetry Forwarding
+String piSerialBuf = "";
+
+// Forward declarations
 void processEspCommand();
+void processPiSerial();
 bool isValidEspCommand(char c);
 bool isValidPiCommand(char c);
 void executeEspCommand(char cmd);
 void executeMotorCommand(char cmd);
 void pollNextUltrasonic();
 long readDistance(int trigPin, int echoPin);
+void updateSensorHealth(uint8_t idx, long d);
 void runUltrasonicAuto();
 void runDualFusion(char piCmd, bool hasNewPiCmd);
 void flushPiSerial();
@@ -150,13 +184,16 @@ void moveFrontLeft();
 void moveFrontRight();
 void moveBackLeft();
 void moveBackRight();
+void sendTelemetryToEsp();
+void updateLcdDisplay();
+void initLcdDisplay();
 
 // ======================================================
 // SETUP
 // ======================================================
 void setup() {
   Serial.begin(115200);   // USB to Raspberry Pi (/dev/ttyACM0)
-  Serial1.begin(115200);  // ESP8266 TX -> Mega RX1 (Pin 19)
+  Serial1.begin(115200);  // ESP8266 TX -> Mega RX1 (Pin 19), Mega TX1 -> Pin 18 via divider
   Serial2.begin(115200);  // Optional RPi GPIO UART (RX2=17, TX2=16)
 
   pinMode(FL_IN1, OUTPUT); pinMode(FL_IN2, OUTPUT);
@@ -181,14 +218,105 @@ void setup() {
   centerServos();
   stopMotors();
 
-  delay(100);
+  // Initialize 20x4 LCD with 400kHz fast I2C
+  initLcdDisplay();
+
+  // Initial sweep of 5 ultrasonic sensors to calibrate health
+  for (int i = 0; i < 5; i++) {
+    pollNextUltrasonic();
+    delay(15);
+  }
+
+  if (lcdFound && activeLcd) {
+    activeLcd->setCursor(0, 2);
+    activeLcd->print(F("Sensors: "));
+    activeLcd->print(healthySensorCount);
+    activeLcd->print(F("/5 Active "));
+    activeLcd->setCursor(0, 3);
+    activeLcd->print(F("Drive Mode: MANUAL  "));
+    delay(400);
+  }
+
+  delay(50);
   while (Serial1.available() > 0) Serial1.read();
   flushPiSerial();
 
-  Serial.println("================================================");
-  Serial.println(" Arduino Mega 4WD Skid-Steer Controller Ready");
-  Serial.println(" Modes: MANUAL | ULTRASONIC | LIDAR | DUAL");
-  Serial.println("================================================");
+  Serial.println(F("================================================"));
+  Serial.println(F(" Arduino Mega 4WD Skid-Steer Controller Ready"));
+  Serial.println(F(" Modes: MANUAL | ULTRASONIC | LIDAR | DUAL | TEST"));
+  Serial.println(F(" LCD 20x4 Fast-I2C Online"));
+  Serial.println(F("================================================"));
+}
+
+// ======================================================
+// RASPBERRY PI SERIAL DISPATCHER (Zero-Latency for Drive)
+// ======================================================
+void processPiSerial() {
+  unsigned long now = millis();
+
+  // Safety Interlock: When another rover is in proximity, ignore drive commands
+  if (isProximityHold) {
+    stopMotors();
+    while (Serial.available() > 0) Serial.read();
+    while (Serial2.available() > 0) Serial2.read();
+    return;
+  }
+
+  // 1. IN AUTONOMOUS DRIVING (LiDAR or Dual Fusion):
+  // ZERO-LATENCY DIRECT DISPATCH: read raw bytes immediately with 0ms buffering!
+  if (currentMode == MODE_LIDAR || currentMode == MODE_DUAL_FUSION) {
+    char latestCmd = 0;
+    while (Serial.available() > 0) {
+      char c = Serial.read();
+      if (isValidPiCommand(c)) {
+        latestCmd = c;
+      }
+    }
+    while (Serial2.available() > 0) {
+      char c = Serial2.read();
+      if (isValidPiCommand(c)) {
+        latestCmd = c;
+      }
+    }
+
+    if (latestCmd != 0) {
+      lastPiMsgTime = now;
+      lastLidarCmdTime = now;
+      lastPiCmd = latestCmd;
+      if (currentMode == MODE_LIDAR) {
+        executeMotorCommand(latestCmd);
+      } else if (currentMode == MODE_DUAL_FUSION) {
+        runDualFusion(latestCmd, true);
+      }
+    }
+    return;
+  }
+
+  // 2. IN SENSOR TEST MODE: buffer lines to forward 36-ray LiDAR map to ESP8266 over Serial1
+  if (currentMode == MODE_TEST) {
+    while (Serial.available() > 0) {
+      char c = Serial.read();
+      if (c == '\n' || c == '\r') {
+        if (piSerialBuf.startsWith("L:")) {
+          lastPiMsgTime = now;
+          Serial1.println(piSerialBuf);
+        }
+        piSerialBuf = "";
+      } else {
+        if (piSerialBuf.length() < 240) {
+          piSerialBuf += c;
+        } else {
+          piSerialBuf = "";
+        }
+      }
+    }
+    return;
+  }
+
+  // 3. IN MANUAL OR ULTRASONIC MODES: drain serial buffers
+  while (Serial.available() > 0) Serial.read();
+  while (Serial2.available() > 0) Serial2.read();
+  piSerialBuf = "";
 }
 
 // ======================================================
@@ -202,67 +330,206 @@ void loop() {
     processEspCommand();
   }
 
-  // 2. Poll ultrasonic sensors round-robin in Ultrasonic or Dual Fusion mode
-  if (currentMode == MODE_ULTRASONIC || currentMode == MODE_DUAL_FUSION) {
+  // 2. Process Raspberry Pi serial commands
+  processPiSerial();
+
+  // 3. Poll ultrasonic sensors round-robin in Ultrasonic, Dual Fusion, or Test mode
+  if (currentMode == MODE_ULTRASONIC || currentMode == MODE_DUAL_FUSION || currentMode == MODE_TEST) {
     if (now - lastSensorPollTime >= SENSOR_POLL_INTERVAL_MS) {
       lastSensorPollTime = now;
       pollNextUltrasonic();
     }
   }
 
-  // 3. Mode-specific execution
-  switch (currentMode) {
-    case MODE_MANUAL:
-      flushPiSerial();
-      if (isStepping && now >= stepEndTime) {
-        stopMotors();
-        isStepping = false;
-      }
-      break;
+  // 4. Periodic Telemetry Stream to ESP8266 over Serial1 (every 120ms)
+  if (now - lastTelemetrySendTime >= 120) {
+    lastTelemetrySendTime = now;
+    sendTelemetryToEsp();
+  }
 
-    case MODE_ULTRASONIC:
-      flushPiSerial();
-      runUltrasonicAuto();
-      break;
+  // 5. Update 20x4 LCD Display
+  // During autonomous driving, update at 500ms so LCD never contends for CPU cycles
+  unsigned long lcdInterval = (currentMode == MODE_LIDAR || currentMode == MODE_DUAL_FUSION) ? 500 : 250;
+  if (now - lastLcdUpdateTime >= lcdInterval) {
+    lastLcdUpdateTime = now;
+    updateLcdDisplay();
+  }
 
-    case MODE_LIDAR:
-    case MODE_DUAL_FUSION: {
-      char latestPiCmd = 0;
-      while (Serial2.available() > 0) {
-        char c = Serial2.read();
-        if (isValidPiCommand(c)) latestPiCmd = c;
-      }
-      while (Serial.available() > 0) {
-        char c = Serial.read();
-        if (isValidPiCommand(c)) latestPiCmd = c;
-      }
+  // 6. Mode-specific execution
+  if (isProximityHold) {
+    stopMotors(); // Rigidly freeze motors while other rover is in proximity
+  } else {
+    switch (currentMode) {
+      case MODE_MANUAL:
+        if (isStepping && now >= stepEndTime) {
+          stopMotors();
+          isStepping = false;
+        }
+        break;
 
-      bool hasNewPiCmd = (latestPiCmd != 0);
-      if (hasNewPiCmd) {
-        lastLidarCmdTime = now;
-        lastPiCmd = latestPiCmd;
-      }
-
-      // Watchdog: pause motors if Pi stops sending, and resync LIDAR:START
-      if (now - lastLidarCmdTime > LIDAR_TIMEOUT_MS) {
-        stopMotors();
+      case MODE_TEST:
+        stopMotors(); // Motors strictly halted in diagnostic mode
         if (now - lastLidarResyncTime > LIDAR_RESYNC_INTERVAL) {
           lastLidarResyncTime = now;
-          sendPiMessage("LIDAR:START");
+          sendPiMessage("LIDAR:TEST");
+        }
+        break;
+
+      case MODE_ULTRASONIC:
+        runUltrasonicAuto();
+        break;
+
+      case MODE_LIDAR:
+      case MODE_DUAL_FUSION: {
+        // Watchdog: pause motors if Pi stops sending, and resync LIDAR:START
+        if (now - lastLidarCmdTime > LIDAR_TIMEOUT_MS) {
+          stopMotors();
+          if (now - lastLidarResyncTime > LIDAR_RESYNC_INTERVAL) {
+            lastLidarResyncTime = now;
+            sendPiMessage("LIDAR:START");
+          }
+          break;
+        }
+
+        if (currentMode == MODE_DUAL_FUSION) {
+          runDualFusion(lastPiCmd, false);
         }
         break;
       }
-
-      if (currentMode == MODE_LIDAR) {
-        if (hasNewPiCmd) {
-          executeMotorCommand(latestPiCmd);
-        }
-      } else {
-        runDualFusion(lastPiCmd, hasNewPiCmd);
-      }
-      break;
     }
   }
+}
+
+// ======================================================
+// LCD 20x4 FUNCTIONS (Fast I2C 400kHz)
+// ======================================================
+void initLcdDisplay() {
+  Wire.begin();
+  Wire.setClock(400000); // 400kHz Fast I2C mode: cuts transmission time from 30ms to 7ms!
+  delay(50); // Allow LCD controller power rise
+  
+  uint8_t foundAddr = 0;
+  // Quick probe standard I2C backpack addresses (0x27 or 0x3F)
+  Wire.beginTransmission(0x27);
+  if (Wire.endTransmission() == 0) foundAddr = 0x27;
+  if (foundAddr == 0) {
+    Wire.beginTransmission(0x3F);
+    if (Wire.endTransmission() == 0) foundAddr = 0x3F;
+  }
+  // Full bus scan if backpack has custom address jumpers
+  if (foundAddr == 0) {
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+      Wire.beginTransmission(addr);
+      if (Wire.endTransmission() == 0) {
+        foundAddr = addr;
+        break;
+      }
+    }
+  }
+
+  if (foundAddr != 0) {
+    activeLcd = new LiquidCrystal_I2C(foundAddr, 20, 4);
+    lcdFound = true;
+    activeLcd->init();
+    activeLcd->backlight();
+    activeLcd->clear();
+    activeLcd->setCursor(0, 0); activeLcd->print(F("* AUTONOMOUS ROVER *"));
+    activeLcd->setCursor(0, 1); activeLcd->print(F("Booting System...   "));
+    activeLcd->setCursor(0, 2); activeLcd->print(F("Sensors Check...    "));
+    activeLcd->setCursor(0, 3); activeLcd->print(F("Connecting ESP & Pi "));
+  } else {
+    lcdFound = false;
+  }
+}
+
+void updateLcdDisplay() {
+  if (!lcdFound || !activeLcd) return;
+
+  // Proximity Alert Override on 20x4 LCD
+  if (isProximityHold) {
+    activeLcd->setCursor(0, 0);
+    activeLcd->print(F("! ROVER ALERT STOP !"));
+    activeLcd->setCursor(0, 1);
+    activeLcd->print(F("ESP:OK  | PROX:NEAR "));
+    activeLcd->setCursor(0, 2);
+    activeLcd->print(F("COLLISION AVOIDANCE "));
+    activeLcd->setCursor(0, 3);
+    activeLcd->print(F("HOLD: ROVER IN RANGE"));
+    return;
+  }
+
+  unsigned long now = millis();
+  bool espOk = (lastEspCmdTime > 0 && (now - lastEspCmdTime < 4500));
+  bool rpiOk = (lastLidarCmdTime > 0 && (now - lastLidarCmdTime < 3500)) || 
+               (lastPiMsgTime > 0 && (now - lastPiMsgTime < 3500));
+
+  // Row 0: Title & Mode
+  activeLcd->setCursor(0, 0);
+  switch (currentMode) {
+    case MODE_MANUAL:      activeLcd->print(F("[ROVER] MANUAL DRIVE")); break;
+    case MODE_ULTRASONIC:  activeLcd->print(F("[ROVER] ULTRASONIC  ")); break;
+    case MODE_LIDAR:       activeLcd->print(F("[ROVER] 2D RPLIDAR  ")); break;
+    case MODE_DUAL_FUSION: activeLcd->print(F("[ROVER] DUAL FUSION ")); break;
+    case MODE_TEST:        activeLcd->print(F("[ROVER] SENSOR TEST ")); break;
+  }
+
+  // Row 1: Wi-Fi ESP8266 & Raspberry Pi link status
+  activeLcd->setCursor(0, 1);
+  activeLcd->print(F("ESP:"));
+  activeLcd->print(espOk ? F("OK  ") : F("WAIT"));
+  activeLcd->print(F(" | RPi:"));
+  activeLcd->print(rpiOk ? F("OK  ") : F("WAIT"));
+
+  // Row 2: Ultrasonic sensor health count & LiDAR health
+  activeLcd->setCursor(0, 2);
+  activeLcd->print(F("US:"));
+  activeLcd->print(healthySensorCount);
+  activeLcd->print(F("/5 OK | LDR:"));
+  activeLcd->print(rpiOk ? F("OK  ") : F("WAIT"));
+
+  // Row 3: Dynamic context information
+  activeLcd->setCursor(0, 3);
+  if (currentMode == MODE_TEST) {
+    activeLcd->print(F("TEST: LIVE SENSORS  "));
+  } else if (currentMode == MODE_MANUAL) {
+    activeLcd->print(F("READY: DRIVE ENABLED"));
+  } else {
+    // Show live front distances
+    activeLcd->print(F("FC:"));
+    if (distFC >= 999) activeLcd->print(F("CLR"));
+    else { if (distFC < 10) activeLcd->print(' '); activeLcd->print(distFC); }
+    activeLcd->print(F(" FL:"));
+    if (distFL >= 999) activeLcd->print(F("CLR"));
+    else { if (distFL < 10) activeLcd->print(' '); activeLcd->print(distFL); }
+    activeLcd->print(F(" FR:"));
+    if (distFR >= 999) activeLcd->print(F("CLR"));
+    else { if (distFR < 10) activeLcd->print(' '); activeLcd->print(distFR); }
+    activeLcd->print(F("cm"));
+  }
+}
+
+// ======================================================
+// TELEMETRY STREAM TO ESP8266
+// ======================================================
+void sendTelemetryToEsp() {
+  unsigned long now = millis();
+  bool rpiOk = (lastLidarCmdTime > 0 && (now - lastLidarCmdTime < 3500)) || 
+               (lastPiMsgTime > 0 && (now - lastPiMsgTime < 3500));
+  bool lidarOk = (currentMode == MODE_LIDAR || currentMode == MODE_DUAL_FUSION) && rpiOk;
+
+  // Compact packet format: "U:fc,fl,fr,l,r,healthy_count,rpi_ok,lidar_ok,mode,prox_hold\n"
+  Serial1.print(F("U:"));
+  Serial1.print(distFC); Serial1.print(',');
+  Serial1.print(distFL); Serial1.print(',');
+  Serial1.print(distFR); Serial1.print(',');
+  Serial1.print(distL);  Serial1.print(',');
+  Serial1.print(distR);  Serial1.print(',');
+  Serial1.print(healthySensorCount); Serial1.print(',');
+  Serial1.print(rpiOk ? 1 : 0); Serial1.print(',');
+  Serial1.print(lidarOk ? 1 : 0); Serial1.print(',');
+  Serial1.print((int)currentMode); Serial1.print(',');
+  Serial1.print(isProximityHold ? 1 : 0);
+  Serial1.print('\n');
 }
 
 // ======================================================
@@ -273,6 +540,8 @@ bool isValidEspCommand(char c) {
     case 'F': case 'B': case 'L': case 'R':
     case 'Q': case 'E': case 'q': case 'e':
     case 'S': case 'A': case 'D': case 'H':
+    case 'T': case 'M':
+    case 'P': case 'p': // Proximity Safety Hold ('P') and Resume ('p')
       return true;
     default:
       return false;
@@ -292,6 +561,7 @@ bool isValidPiCommand(char c) {
 
 void processEspCommand() {
   delay(2);
+  lastEspCmdTime = millis();
 
   if (Serial1.available() > 2) {
     bool isBannerOrNoise = false;
@@ -328,6 +598,26 @@ void processEspCommand() {
 void executeEspCommand(char cmd) {
   isStepping = false;
 
+  // ======================================================
+  // PROXIMITY SAFETY INTERLOCK (ROVER-TO-ROVER AVOIDANCE)
+  // ======================================================
+  if (cmd == 'P') {
+    isProximityHold = true;
+    stopMotors();          // Freeze all 4 wheels immediately
+    updateLcdDisplay();
+    return;
+  }
+
+  if (cmd == 'p') {
+    isProximityHold = false;
+    // Resume previous autonomous mode smoothly
+    if (currentMode == MODE_ULTRASONIC) {
+      autoState = AUTO_IDLE; // Restarts forward motion safely
+    }
+    updateLcdDisplay();
+    return;
+  }
+
   if (cmd == 'A') {
     currentMode = MODE_ULTRASONIC;
     autoState = AUTO_IDLE;
@@ -335,6 +625,7 @@ void executeEspCommand(char cmd) {
     stopMotors();
     sendPiMessage("LIDAR:STOP");
     flushPiSerial();
+    updateLcdDisplay();
     return;
   }
 
@@ -347,6 +638,7 @@ void executeEspCommand(char cmd) {
     stopMotors();
     flushPiSerial();
     sendPiMessage("LIDAR:START");
+    updateLcdDisplay();
     return;
   }
 
@@ -361,6 +653,34 @@ void executeEspCommand(char cmd) {
     stopMotors();
     flushPiSerial();
     sendPiMessage("LIDAR:START");
+    updateLcdDisplay();
+    return;
+  }
+
+  if (cmd == 'T') {
+    currentMode = MODE_TEST;
+    autoState = AUTO_IDLE;
+    dualState = DUAL_PASS_THROUGH;
+    centerServos();
+    stopMotors();
+    flushPiSerial();
+    sendPiMessage("LIDAR:TEST");
+    lastLidarResyncTime = millis();
+    updateLcdDisplay();
+    return;
+  }
+
+  if (cmd == 'M') {
+    if (currentMode == MODE_LIDAR || currentMode == MODE_DUAL_FUSION) {
+      sendPiMessage("LIDAR:STOP");
+    }
+    currentMode = MODE_MANUAL;
+    autoState = AUTO_IDLE;
+    dualState = DUAL_PASS_THROUGH;
+    centerServos();
+    stopMotors();
+    flushPiSerial();
+    updateLcdDisplay();
     return;
   }
 
@@ -374,6 +694,7 @@ void executeEspCommand(char cmd) {
     centerServos();
     stopMotors();
     flushPiSerial();
+    updateLcdDisplay();
   }
 
   executeMotorCommand(cmd);
@@ -397,7 +718,15 @@ void flushPiSerial() {
 // ======================================================
 void runDualFusion(char piCmd, bool hasNewPiCmd) {
   unsigned long now = millis();
-  long frontMin = min(distFC, min(distFL, distFR));
+  
+  // Use healthy sensors only
+  long effFC = sensorHealthy[0] ? distFC : 999;
+  long effFL = sensorHealthy[1] ? distFL : 999;
+  long effFR = sensorHealthy[2] ? distFR : 999;
+  long effL  = sensorHealthy[3] ? distL  : 999;
+  long effR  = sensorHealthy[4] ? distR  : 999;
+
+  long frontMin = min(effFC, min(effFL, effFR));
 
   switch (dualState) {
     case DUAL_PASS_THROUGH:
@@ -411,12 +740,12 @@ void runDualFusion(char piCmd, bool hasNewPiCmd) {
 
       if (frontMin < DUAL_FRONT_CM && (piCmd == 'F' || piCmd == 'I' || piCmd == 'O')) {
         stopMotors();
-        if (distL < SIDE_BLOCK_DIST_CM && distR >= SIDE_BLOCK_DIST_CM) {
+        if (effL < SIDE_BLOCK_DIST_CM && effR >= SIDE_BLOCK_DIST_CM) {
           dualTurnDir = 1;
-        } else if (distR < SIDE_BLOCK_DIST_CM && distL >= SIDE_BLOCK_DIST_CM) {
+        } else if (effR < SIDE_BLOCK_DIST_CM && effL >= SIDE_BLOCK_DIST_CM) {
           dualTurnDir = -1;
         } else {
-          dualTurnDir = (distL > distR) ? -1 : 1;
+          dualTurnDir = (effL > effR) ? -1 : 1;
         }
         if (dualTurnDir < 0) rotateLeft();
         else rotateRight();
@@ -426,10 +755,10 @@ void runDualFusion(char piCmd, bool hasNewPiCmd) {
       }
 
       if (piCmd == 'F') {
-        if (distL < DUAL_SIDE_CM && distR >= DUAL_SIDE_CM) {
+        if (effL < DUAL_SIDE_CM && effR >= DUAL_SIDE_CM) {
           moveFrontRight();
           return;
-        } else if (distR < DUAL_SIDE_CM && distL >= DUAL_SIDE_CM) {
+        } else if (effR < DUAL_SIDE_CM && effL >= DUAL_SIDE_CM) {
           moveFrontLeft();
           return;
         }
@@ -443,7 +772,7 @@ void runDualFusion(char piCmd, bool hasNewPiCmd) {
     case DUAL_BACKUP:
       if (now - dualOverrideStart >= 320) {
         stopMotors();
-        dualTurnDir = (distL > distR) ? -1 : 1;
+        dualTurnDir = (effL > effR) ? -1 : 1;
         if (dualTurnDir < 0) rotateLeft();
         else rotateRight();
         dualState = DUAL_ROTATE;
@@ -452,7 +781,7 @@ void runDualFusion(char piCmd, bool hasNewPiCmd) {
       break;
 
     case DUAL_ROTATE:
-      if (distFC > DUAL_CLEAR_CM && distFL > DUAL_CLEAR_CM && distFR > DUAL_CLEAR_CM) {
+      if (effFC > DUAL_CLEAR_CM && effFL > DUAL_CLEAR_CM && effFR > DUAL_CLEAR_CM) {
         dualState = DUAL_PASS_THROUGH;
         executeMotorCommand(piCmd);
       } else if (now - dualOverrideStart > 3000) {
@@ -470,6 +799,13 @@ void runDualFusion(char piCmd, bool hasNewPiCmd) {
 void runUltrasonicAuto() {
   unsigned long now = millis();
 
+  // Fault-tolerant sensor reading: failed sensors report 999 and do not block the rover
+  long effFC = sensorHealthy[0] ? distFC : 999;
+  long effFL = sensorHealthy[1] ? distFL : 999;
+  long effFR = sensorHealthy[2] ? distFR : 999;
+  long effL  = sensorHealthy[3] ? distL  : 999;
+  long effR  = sensorHealthy[4] ? distR  : 999;
+
   switch (autoState) {
     case AUTO_IDLE:
       moveForward();
@@ -480,7 +816,7 @@ void runUltrasonicAuto() {
     case AUTO_FORWARD:
       updateServoSweep();
 
-      if (distFC < CRITICAL_DIST_CM || distFL < CRITICAL_DIST_CM || distFR < CRITICAL_DIST_CM) {
+      if (effFC < CRITICAL_DIST_CM || effFL < CRITICAL_DIST_CM || effFR < CRITICAL_DIST_CM) {
         stopMotors();
         centerServos();
         moveBackward();
@@ -489,12 +825,12 @@ void runUltrasonicAuto() {
         return;
       }
 
-      if (distFC < OBSTACLE_DIST_CM || distFL < OBSTACLE_DIST_CM || distFR < OBSTACLE_DIST_CM) {
+      if (effFC < OBSTACLE_DIST_CM || effFL < OBSTACLE_DIST_CM || effFR < OBSTACLE_DIST_CM) {
         stopMotors();
         centerServos();
 
-        bool rightBlocked = (distR < SIDE_BLOCK_DIST_CM);
-        bool leftBlocked  = (distL < SIDE_BLOCK_DIST_CM);
+        bool rightBlocked = (effR < SIDE_BLOCK_DIST_CM);
+        bool leftBlocked  = (effL < SIDE_BLOCK_DIST_CM);
 
         if (rightBlocked && !leftBlocked) {
           turnDirection = -1;
@@ -506,14 +842,14 @@ void runUltrasonicAuto() {
           autoStateStartTime = now;
           return;
         } else {
-          if (abs(distL - distR) > 8) {
-            turnDirection = (distL > distR) ? -1 : 1;
-          } else if (distFL < distFR - 3) {
+          if (abs(effL - effR) > 8) {
+            turnDirection = (effL > effR) ? -1 : 1;
+          } else if (effFL < effFR - 3) {
             turnDirection = 1;
-          } else if (distFR < distFL - 3) {
+          } else if (effFR < effFL - 3) {
             turnDirection = -1;
           } else {
-            turnDirection = (distL >= distR) ? -1 : 1;
+            turnDirection = (effL >= effR) ? -1 : 1;
           }
         }
 
@@ -525,9 +861,9 @@ void runUltrasonicAuto() {
       }
 
       // Side wall repulsion using normal 4WD skid-steer curves
-      if (distL < SIDE_AVOID_DIST_CM && distR >= SIDE_AVOID_DIST_CM) {
+      if (effL < SIDE_AVOID_DIST_CM && effR >= SIDE_AVOID_DIST_CM) {
         moveFrontRight();
-      } else if (distR < SIDE_AVOID_DIST_CM && distL >= SIDE_AVOID_DIST_CM) {
+      } else if (effR < SIDE_AVOID_DIST_CM && effL >= SIDE_AVOID_DIST_CM) {
         moveFrontLeft();
       } else {
         moveForward();
@@ -538,7 +874,7 @@ void runUltrasonicAuto() {
       centerServos();
       if (now - autoStateStartTime >= 350) {
         stopMotors();
-        turnDirection = (distL > distR) ? -1 : 1;
+        turnDirection = (effL > effR) ? -1 : 1;
         if (turnDirection < 0) rotateLeft();
         else rotateRight();
         autoState = AUTO_ROTATE;
@@ -548,7 +884,7 @@ void runUltrasonicAuto() {
 
     case AUTO_ROTATE:
       centerServos();
-      if (distFC > CLEAR_DIST_CM && distFL > CLEAR_DIST_CM && distFR > CLEAR_DIST_CM) {
+      if (effFC > CLEAR_DIST_CM && effFL > CLEAR_DIST_CM && effFR > CLEAR_DIST_CM) {
         stopMotors();
         delay(30);
         moveForward();
@@ -567,15 +903,48 @@ void runUltrasonicAuto() {
 }
 
 // ======================================================
-// NON-BLOCKING ROUND-ROBIN ULTRASONIC POLLING
+// NON-BLOCKING ROUND-ROBIN ULTRASONIC POLLING WITH HEALTH
 // ======================================================
+void updateSensorHealth(uint8_t idx, long d) {
+  if (d >= 999) {
+    if (sensorFailCount[idx] < 255) sensorFailCount[idx]++;
+    if (sensorFailCount[idx] > 25) {
+      sensorHealthy[idx] = false;
+    }
+  } else {
+    sensorFailCount[idx] = 0;
+    sensorHealthy[idx] = true;
+  }
+
+  uint8_t count = 0;
+  for (int i = 0; i < 5; i++) {
+    if (sensorHealthy[i]) count++;
+  }
+  healthySensorCount = count;
+}
+
 void pollNextUltrasonic() {
   switch (nextSensorIdx) {
-    case 0: distFC = readDistance(TRIG_FC, ECHO_FC); break;
-    case 1: distFL = readDistance(TRIG_FL, ECHO_FL); break;
-    case 2: distFR = readDistance(TRIG_FR, ECHO_FR); break;
-    case 3: distL  = readDistance(TRIG_L,  ECHO_L);  break;
-    case 4: distR  = readDistance(TRIG_R,  ECHO_R);  break;
+    case 0:
+      distFC = readDistance(TRIG_FC, ECHO_FC);
+      updateSensorHealth(0, distFC);
+      break;
+    case 1:
+      distFL = readDistance(TRIG_FL, ECHO_FL);
+      updateSensorHealth(1, distFL);
+      break;
+    case 2:
+      distFR = readDistance(TRIG_FR, ECHO_FR);
+      updateSensorHealth(2, distFR);
+      break;
+    case 3:
+      distL  = readDistance(TRIG_L,  ECHO_L);
+      updateSensorHealth(3, distL);
+      break;
+    case 4:
+      distR  = readDistance(TRIG_R,  ECHO_R);
+      updateSensorHealth(4, distR);
+      break;
   }
   nextSensorIdx = (nextSensorIdx + 1) % 5;
 }
@@ -597,6 +966,12 @@ long readDistance(int trigPin, int echoPin) {
 // MOTOR COMMAND DISPATCHER & 4WD SKID-STEER KINEMATICS
 // ======================================================
 void executeMotorCommand(char cmd) {
+  // Lockout all motor movements while in Proximity Hold
+  if (isProximityHold && cmd != 'S') {
+    stopMotors();
+    return;
+  }
+
   switch (cmd) {
     case 'F': moveForward(); break;
     case 'B': moveBackward(); break;
